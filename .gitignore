@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+progres_tournois.json
+tournois_extraits.xlsx
