@@ -27,18 +27,27 @@ from openpyxl.styles import Alignment, Font, PatternFill
 # ---------------------------------------------------------------------------
 
 def extraire_codes_tournois(chemin_pdf):
-    """Extrait les 6 derniers chiffres de chaque code tournoi du PDF."""
+    """Extrait les 6 derniers chiffres de chaque code tournoi du PDF.
+
+    Supporte les codes T (tournoi) et C (championnat).
+    Ex: CODE : T 20265777048200197275  -> 197275
+        CODE : C 202657L0077000169679  -> 169679
+    """
     codes = []
     reader = PdfReader(chemin_pdf)
     for page in reader.pages:
         texte = page.extract_text()
         if not texte:
             continue
-        matches = re.findall(r"CODE\s*:\s*T\s*(\d+)", texte)
+        # Capture les codes T et C (peuvent contenir des lettres)
+        matches = re.findall(r"CODE\s*:\s*[TC]\s*(\S+)", texte)
         for match in matches:
-            code_6 = match[-6:]
-            if code_6 not in codes:
-                codes.append(code_6)
+            # Extrait les 6 derniers chiffres (ignore les lettres en fin)
+            digits = re.findall(r"\d", match)
+            if len(digits) >= 6:
+                code_6 = "".join(digits[-6:])
+                if code_6 not in codes:
+                    codes.append(code_6)
     return codes
 
 
