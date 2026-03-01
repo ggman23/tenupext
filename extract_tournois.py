@@ -363,6 +363,26 @@ def _normaliser_espaces(texte):
     return re.sub(r"[\xa0\u202f\u2007\u2009\u200a]", " ", texte)
 
 
+def _est_valeur_valide(texte):
+    """Vérifie que la valeur extraite n'est pas du bruit (JS, template, pub)."""
+    if not texte or len(texte.strip()) < 2:
+        return False
+    # Rejeter le JavaScript / publicitaire
+    if re.search(
+        r"googletag|eSlot|pubads|gpt-ad|addService|defineSl|\.js\b|"
+        r"adsbygoogle|__webpack|function\s*\(|var\s+\w|window\.",
+        texte, re.IGNORECASE,
+    ):
+        return False
+    # Rejeter les fragments de template / placeholder connus de tenup
+    if re.search(
+        r"du club.*ville|Ville.*Date.*debut|^\s*/\s*fin\s*$",
+        texte, re.IGNORECASE,
+    ):
+        return False
+    return True
+
+
 def parser_page_tournoi(html, code):
     """Parse le HTML d'une page tournoi et retourne les infos structurées."""
     # Normaliser les espaces insécables dans tout le HTML
@@ -385,6 +405,11 @@ def parser_page_tournoi(html, code):
     }
 
     soup = BeautifulSoup(html, "html.parser")
+
+    # Supprimer les scripts, styles et pubs pour ne pas matcher du JS/CSS
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+
     texte_complet = soup.get_text(separator="\n")
 
     # --- Infos générales ---
@@ -404,6 +429,11 @@ def parser_page_tournoi(html, code):
     info["mail"] = _extraire_mail(soup)
     info["tel"] = _extraire_tel(soup)
 
+    # Valider les dates (format attendu : JJ/MM/AAAA)
+    for champ in ("debut", "fin"):
+        if info[champ] and not re.match(r"\d{2}/\d{2}/\d{2,4}", info[champ]):
+            info[champ] = ""
+
     # Fallback via regex sur le texte complet
     _fallback_texte(info, texte_complet)
 
@@ -414,7 +444,10 @@ def parser_page_tournoi(html, code):
 
 
 def _extraire_texte_label(soup, label):
-    """Cherche un label suivi de sa valeur dans le HTML."""
+    """Cherche un label suivi de sa valeur dans le HTML.
+
+    Ignore les valeurs qui ressemblent à du bruit (JS, pubs, template).
+    """
     # Stratégie 1 : élément contenant exactement le label
     elements = soup.find_all(
         string=re.compile(rf"^\s*{re.escape(label)}\s*$", re.IGNORECASE)
@@ -425,13 +458,13 @@ def _extraire_texte_label(soup, label):
             sibling = parent.find_next_sibling()
             if sibling:
                 texte = sibling.get_text(strip=True)
-                if texte:
+                if texte and _est_valeur_valide(texte):
                     return texte
             texte_parent = parent.get_text(strip=True)
             texte_parent = re.sub(
                 rf"^\s*{re.escape(label)}\s*:?\s*", "", texte_parent
             )
-            if texte_parent:
+            if texte_parent and _est_valeur_valide(texte_parent):
                 return texte_parent
 
     # Stratégie 2 : "label : valeur" dans un même noeud texte
@@ -440,7 +473,9 @@ def _extraire_texte_label(soup, label):
     for el in elements:
         match = pattern.search(el)
         if match:
-            return match.group(1).strip()
+            val = match.group(1).strip()
+            if _est_valeur_valide(val):
+                return val
 
     return ""
 
@@ -468,9 +503,16 @@ def _extraire_tel(soup):
 
 
 def _chercher_dans_texte(texte, pattern):
-    """Cherche un pattern regex dans le texte et retourne le 1er groupe."""
+    """Cherche un pattern regex dans le texte et retourne le 1er groupe.
+
+    Valide que le résultat n'est pas du bruit.
+    """
     match = re.search(pattern, texte, re.IGNORECASE)
-    return match.group(1).strip() if match else ""
+    if match:
+        val = match.group(1).strip()
+        if _est_valeur_valide(val):
+            return val
+    return ""
 
 
 def _fallback_texte(info, texte):
