@@ -453,29 +453,60 @@ def parser_page_tournoi(html, code):
 
     texte_complet = soup.get_text(separator="\n")
 
-    # --- Infos générales ---
-    info["nom"] = _extraire_texte_label(soup, "Nom")
-    info["club"] = _extraire_texte_label(soup, "Club")
-    info["debut"] = (
-        _extraire_texte_label(soup, "Début")
-        or _extraire_texte_label(soup, "Debut")
-    )
-    info["fin"] = _extraire_texte_label(soup, "Fin")
-    info["surface"] = _extraire_texte_label(soup, "Surface")
+    # --- Infos générales via sélecteurs CSS (structure tenup.fft.fr) ---
+
+    # Nom du tournoi : <h1 itemprop="name">...</h1>
+    el = soup.select_one(".tournoi-detail-page-title h1")
+    if not el:
+        el = soup.select_one("h1[itemprop='name']")
+    if el:
+        info["nom"] = el.get_text(strip=True)
+
+    # Club / Ville : <h2 class="tournoi-detail-page-club">CLUB / VILLE</h2>
+    el = soup.select_one(".tournoi-detail-page-club")
+    if el:
+        info["club"] = el.get_text(strip=True)
+
+    # Dates : <span class="tournoi-detail-page-date-debut">JJ/MM/AA</span>
+    el = soup.select_one(".tournoi-detail-page-date-debut")
+    if el:
+        info["debut"] = el.get_text(strip=True)
+    el = soup.select_one(".tournoi-detail-page-date-fin")
+    if el:
+        info["fin"] = el.get_text(strip=True)
+
+    # Surface : <span class="tournoi-detail-page-competition-surfaces-content">
+    el = soup.select_one(".tournoi-detail-page-competition-surfaces-content")
+    if el:
+        info["surface"] = el.get_text(strip=True)
+
+    # Lieu : addr1 (nom du stade) + addr2 (code postal + ville)
+    lieu_parts = []
+    el = soup.select_one(".tournoi-detail-page-lieu-addr1")
+    if el:
+        lieu_parts.append(el.get_text(strip=True))
+    el = soup.select_one(".tournoi-detail-page-lieu-addr2")
+    if el:
+        lieu_parts.append(el.get_text(strip=True))
+    if lieu_parts:
+        info["lieu"] = ", ".join(lieu_parts)
+
+    # Juge-arbitre : chercher dans le texte (pas de classe CSS dédiée)
     info["juge_arbitre"] = (
         _extraire_texte_label(soup, "Juge Arbitre")
         or _extraire_texte_label(soup, "Juge-Arbitre")
     )
-    info["lieu"] = _extraire_texte_label(soup, "Lieu")
+
+    # Email et téléphone
     info["mail"] = _extraire_mail(soup)
     info["tel"] = _extraire_tel(soup)
 
-    # Valider les dates (format attendu : JJ/MM/AAAA)
+    # Valider les dates (format attendu : JJ/MM/AAAA ou JJ/MM/AA)
     for champ in ("debut", "fin"):
         if info[champ] and not re.match(r"\d{2}/\d{2}/\d{2,4}", info[champ]):
             info[champ] = ""
 
-    # Fallback via regex sur le texte complet
+    # Fallback via regex sur le texte complet (pour les champs non trouvés)
     _fallback_texte(info, texte_complet)
 
     # --- Épreuves ---
