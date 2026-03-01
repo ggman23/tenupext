@@ -332,82 +332,50 @@ def _fallback_texte(info, texte):
 # ---------------------------------------------------------------------------
 
 def _extraire_epreuves(soup, texte_complet):
-    """Extrait les épreuves avec catégorie d'âge 11/12 ans ou 11 ans.
+    """Extrait l'épreuve Simple Messieurs (TS) avec Âge 11/12 ans.
 
-    Cherche toutes les épreuves (Simple Messieurs, Simple Garçons, etc.)
-    qui correspondent à la tranche d'âge 11/12 ans.
+    Retourne une liste avec au plus 1 épreuve par tournoi.
     """
-    epreuves = []
+    # Stratégie 1 : Chercher chaque "Simple Messieurs" dans le DOM
+    # et vérifier si le bloc parent contient "11/12 ans"
+    sm_elements = soup.find_all(
+        string=re.compile(r"Simple\s+Messieurs", re.IGNORECASE)
+    )
 
-    # Stratégie 1 : Chercher dans le DOM les sections contenant "11/12"
-    # ou "11 ans" en combinaison avec une épreuve de simple
-    age_patterns = [
-        r"11\s*/\s*12",               # 11/12
-        r"11.12\s*ans",               # 11-12 ans, 11/12 ans
-        r"[ÂA]ge\s*:\s*11",           # Âge : 11...
-    ]
-    epreuve_name_patterns = [
-        r"Simple\s+Messieurs",        # Simple Messieurs uniquement
-    ]
-
-    # Cherche les blocs HTML contenant "11/12" ou "11 ans"
-    age_elements = []
-    for pattern in age_patterns:
-        age_elements.extend(
-            soup.find_all(string=re.compile(pattern, re.IGNORECASE))
-        )
-
-    for age_text in age_elements:
-        parent = age_text.find_parent()
-        bloc = parent
+    for sm_text in sm_elements:
+        # Remonter dans le DOM pour trouver le bloc de l'épreuve
+        bloc = sm_text.find_parent()
         for _ in range(15):
             if bloc is None or bloc.name in ("body", "html", "[document]"):
                 break
             bloc_text = bloc.get_text()
-            # Vérifie si ce bloc contient une épreuve de simple
-            has_simple = any(
-                re.search(p, bloc_text, re.IGNORECASE)
-                for p in epreuve_name_patterns
-            )
-            has_age = re.search(
-                r"11\s*[/\-]\s*12|[ÂA]ge\s*:?\s*11\s*ans",
+            # Vérifier que ce bloc contient "11/12" dans un champ Âge
+            has_age_11_12 = re.search(
+                r"[ÂA]ge\s*:?\s*11\s*[/\-]\s*12",
                 bloc_text, re.IGNORECASE,
             )
-            if has_simple and has_age:
-                epreuve = _extraire_details_epreuve(bloc)
-                if epreuve and epreuve not in epreuves:
-                    epreuves.append(epreuve)
-                break
+            if has_age_11_12:
+                # Vérifier que ce bloc ne contient PAS d'autres catégories d'âge
+                # (sinon on est remonté trop haut et on a un bloc parent global)
+                nb_ages = len(re.findall(
+                    r"[ÂA]ge\s*:", bloc_text, re.IGNORECASE
+                ))
+                if nb_ages <= 1:
+                    # Bloc spécifique à cette épreuve
+                    epreuve = _extraire_details_epreuve(bloc)
+                    if epreuve:
+                        return [epreuve]
+                else:
+                    # On est dans un bloc trop large, essayer de remonter moins
+                    break
             bloc = bloc.parent
 
-    # Stratégie 2 : Chercher les sections "Simple Messieurs" et remonter
-    for pattern in epreuve_name_patterns:
-        epreuve_sections = soup.find_all(
-            string=re.compile(pattern, re.IGNORECASE)
-        )
-        for section_text in epreuve_sections:
-            parent = section_text.find_parent()
-            bloc = parent
-            for _ in range(15):
-                if bloc is None or bloc.name in ("body", "html", "[document]"):
-                    break
-                bloc_text = bloc.get_text()
-                has_age = re.search(
-                    r"11\s*[/\-]\s*12|[ÂA]ge\s*:?\s*11\s*ans",
-                    bloc_text, re.IGNORECASE,
-                )
-                if has_age:
-                    epreuve = _extraire_details_epreuve(bloc)
-                    if epreuve and epreuve not in epreuves:
-                        epreuves.append(epreuve)
-                    break
-                bloc = bloc.parent
+    # Stratégie 2 : analyse du texte brut ligne par ligne
+    epreuves = _extraire_epreuves_depuis_texte(texte_complet)
+    if epreuves:
+        return [epreuves[0]]  # Au plus 1 résultat
 
-    # Fallback : analyse du texte brut
-    if not epreuves:
-        epreuves = _extraire_epreuves_depuis_texte(texte_complet)
-
-    return epreuves
+    return []
 
 
 def _extraire_details_epreuve(bloc):
@@ -464,45 +432,36 @@ def _extraire_details_epreuve(bloc):
 def _extraire_epreuves_depuis_texte(texte):
     """Fallback : extraction depuis le texte brut de la page.
 
-    Cherche toute épreuve de simple (Messieurs, Garçons, Dames, Filles)
-    avec catégorie d'âge 11/12 ans.
+    Cherche chaque bloc "Simple Messieurs" et vérifie si son Âge est 11/12.
+    Ne regarde que les lignes entre ce "Simple Messieurs" et le prochain
+    "Simple " (Dames/Messieurs suivant) pour éviter les faux positifs.
     """
     epreuves = []
     lines = texte.split("\n")
 
-    # Pattern pour détecter une ligne d'épreuve Simple Messieurs uniquement
-    combined_epreuve_pattern = r"Simple\s+Messieurs"
-
-    # Patterns pour détecter l'âge 11/12
-    age_pattern = r"11\s*[/\-]\s*12|[ÂA]ge\s*:?\s*11\s*ans"
-
     i = 0
     while i < len(lines):
         line = lines[i]
-        if re.search(combined_epreuve_pattern, line, re.IGNORECASE):
-            bloc_debut = max(0, i - 5)
-            bloc_fin = min(len(lines), i + 30)
-            bloc = "\n".join(lines[bloc_debut:bloc_fin])
+        if re.search(r"Simple\s+Messieurs", line, re.IGNORECASE):
+            # Chercher la fin du bloc : prochaine ligne "Simple " ou fin
+            bloc_fin = min(len(lines), i + 50)
+            for j in range(i + 1, bloc_fin):
+                if re.search(r"Simple\s+(Messieurs|Dames|Gar|Filles)",
+                             lines[j], re.IGNORECASE):
+                    bloc_fin = j
+                    break
 
-            if re.search(age_pattern, bloc, re.IGNORECASE):
-                epreuve = {}
+            bloc = "\n".join(lines[i:bloc_fin])
+
+            # Vérifier que CE bloc contient 11/12 ans
+            if re.search(r"[ÂA]ge\s*:?\s*11\s*[/\-]\s*12", bloc, re.IGNORECASE):
+                epreuve = {"nom_epreuve": line.strip()}
+
                 match = re.search(
                     r"Tarif\s+jeune\s*:?\s*([\d,]+\s*€)", bloc, re.IGNORECASE
                 )
                 if match:
                     epreuve["tarif_jeune"] = match.group(1).strip()
-                else:
-                    match = re.search(
-                        r"Tarif\s+jeune\s*:?\s*(.+?)(?:\n|$)", bloc, re.IGNORECASE
-                    )
-                    if match:
-                        epreuve["tarif_jeune"] = match.group(1).strip()
-                if "tarif_jeune" not in epreuve:
-                    match = re.search(
-                        r"Tarif\s*:?\s*([\d,]+\s*€)", bloc, re.IGNORECASE
-                    )
-                    if match:
-                        epreuve["tarif_jeune"] = match.group(1).strip()
 
                 match = re.search(
                     r"Classement\s*:?\s*(.+?)(?:\n|$)", bloc, re.IGNORECASE
@@ -521,19 +480,11 @@ def _extraire_epreuves_depuis_texte(texte):
                 )
                 if match:
                     epreuve["age"] = match.group(1).strip()
-                if "age" not in epreuve:
-                    match = re.search(
-                        r"(11\s*[/\-]\s*12\s*ans)", bloc, re.IGNORECASE
-                    )
-                    if match:
-                        epreuve["age"] = match.group(1).strip()
 
-                epreuve["nom_epreuve"] = line.strip()
-                if epreuve:
-                    epreuves.append(epreuve)
+                return [epreuve]  # 1 seul résultat
         i += 1
 
-    return epreuves
+    return []
 
 
 # ---------------------------------------------------------------------------
