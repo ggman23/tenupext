@@ -347,11 +347,7 @@ def _extraire_epreuves(soup, texte_complet):
         r"[ÂA]ge\s*:\s*11",           # Âge : 11...
     ]
     epreuve_name_patterns = [
-        r"Simple\s+Messieurs",        # Adultes / Mixte
-        r"Simple\s+Gar[çc]ons",       # Garçons (jeunes)
-        r"Simple\s+Dames",            # Dames
-        r"Simple\s+Filles",           # Filles (jeunes)
-        r"Simple",                     # Générique
+        r"Simple\s+Messieurs",        # Simple Messieurs uniquement
     ]
 
     # Cherche les blocs HTML contenant "11/12" ou "11 ans"
@@ -384,8 +380,8 @@ def _extraire_epreuves(soup, texte_complet):
                 break
             bloc = bloc.parent
 
-    # Stratégie 2 : Chercher les sections "Simple ..." et remonter
-    for pattern in epreuve_name_patterns[:4]:  # Pas le générique "Simple"
+    # Stratégie 2 : Chercher les sections "Simple Messieurs" et remonter
+    for pattern in epreuve_name_patterns:
         epreuve_sections = soup.find_all(
             string=re.compile(pattern, re.IGNORECASE)
         )
@@ -455,20 +451,12 @@ def _extraire_details_epreuve(bloc):
         if match:
             epreuve["age"] = match.group(1).strip()
 
-    # Nom de l'épreuve - accepte tous les types
-    nom_patterns = [
-        r"(Simple\s+Messieurs\s*(?:\(TS\))?.*?)(?:\n|$)",
-        r"(Simple\s+Gar[çc]ons\s*(?:\(TS\))?.*?)(?:\n|$)",
-        r"(Simple\s+Dames\s*(?:\(TS\))?.*?)(?:\n|$)",
-        r"(Simple\s+Filles\s*(?:\(TS\))?.*?)(?:\n|$)",
-        r"(Simple\s+\S+\s*(?:\(TS\))?.*?)(?:\n|$)",
-        r"(Tableau\s+.*?11\s*[/\-]\s*12.*?)(?:\n|$)",
-    ]
-    for nom_pattern in nom_patterns:
-        match = re.search(nom_pattern, texte, re.IGNORECASE)
-        if match:
-            epreuve["nom_epreuve"] = match.group(1).strip()
-            break
+    # Nom de l'épreuve - Simple Messieurs uniquement
+    match = re.search(
+        r"(Simple\s+Messieurs\s*(?:\(TS\))?.*?)(?:\n|$)", texte, re.IGNORECASE
+    )
+    if match:
+        epreuve["nom_epreuve"] = match.group(1).strip()
 
     return epreuve if epreuve else None
 
@@ -482,16 +470,8 @@ def _extraire_epreuves_depuis_texte(texte):
     epreuves = []
     lines = texte.split("\n")
 
-    # Patterns pour détecter une ligne d'épreuve
-    epreuve_line_patterns = [
-        r"Simple\s+Messieurs",
-        r"Simple\s+Gar[çc]ons",
-        r"Simple\s+Dames",
-        r"Simple\s+Filles",
-        r"Simple\s+\S+",
-        r"Tableau\s+.*11\s*[/\-]\s*12",
-    ]
-    combined_epreuve_pattern = "|".join(epreuve_line_patterns)
+    # Pattern pour détecter une ligne d'épreuve Simple Messieurs uniquement
+    combined_epreuve_pattern = r"Simple\s+Messieurs"
 
     # Patterns pour détecter l'âge 11/12
     age_pattern = r"11\s*[/\-]\s*12|[ÂA]ge\s*:?\s*11\s*ans"
@@ -551,52 +531,6 @@ def _extraire_epreuves_depuis_texte(texte):
                 epreuve["nom_epreuve"] = line.strip()
                 if epreuve:
                     epreuves.append(epreuve)
-        # Aussi chercher directement les lignes contenant "11/12"
-        # même sans un mot-clé "Simple" explicite
-        elif re.search(r"11\s*[/\-]\s*12\s*ans", line, re.IGNORECASE):
-            bloc_debut = max(0, i - 10)
-            bloc_fin = min(len(lines), i + 20)
-            bloc = "\n".join(lines[bloc_debut:bloc_fin])
-            epreuve = {}
-            # Chercher le nom de l'épreuve dans le contexte
-            match = re.search(
-                r"(Simple\s+\S+.*?)(?:\n|$)", bloc, re.IGNORECASE
-            )
-            if match:
-                epreuve["nom_epreuve"] = match.group(1).strip()
-            else:
-                epreuve["nom_epreuve"] = line.strip()
-
-            match = re.search(
-                r"Tarif\s+jeune\s*:?\s*([\d,]+\s*€)", bloc, re.IGNORECASE
-            )
-            if match:
-                epreuve["tarif_jeune"] = match.group(1).strip()
-            else:
-                match = re.search(
-                    r"Tarif\s*:?\s*([\d,]+\s*€)", bloc, re.IGNORECASE
-                )
-                if match:
-                    epreuve["tarif_jeune"] = match.group(1).strip()
-
-            match = re.search(
-                r"Classement\s*:?\s*(.+?)(?:\n|$)", bloc, re.IGNORECASE
-            )
-            if match:
-                epreuve["classement"] = match.group(1).strip()
-
-            match = re.search(
-                r"[ÂA]ge\s*:?\s*(.+?)(?:\n|$)", bloc, re.IGNORECASE
-            )
-            if match:
-                epreuve["age"] = match.group(1).strip()
-            else:
-                epreuve["age"] = re.search(
-                    r"(11\s*[/\-]\s*12\s*ans)", line, re.IGNORECASE
-                ).group(1).strip()
-
-            if epreuve and epreuve not in epreuves:
-                epreuves.append(epreuve)
         i += 1
 
     return epreuves
