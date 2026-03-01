@@ -56,6 +56,170 @@ def extraire_codes_tournois(chemin_pdf):
     return codes
 
 
+def extraire_tournois_du_pdf(chemin_pdf):
+    """Extrait les codes ET les infos de base de chaque tournoi depuis le PDF.
+
+    Le PDF contient : nom, club, dates, surface, juge-arbitre, lieu, contact, tarifs.
+    Ces infos sont plus fiables et plus rapides à obtenir que le scraping URL.
+    Le classement du PDF est ignoré (toujours « Open », souvent faux).
+    Le format n'est pas dans le PDF (uniquement sur l'URL).
+    """
+    reader = PdfReader(chemin_pdf)
+    texte_complet = ""
+    for page in reader.pages:
+        texte = page.extract_text()
+        if texte:
+            texte_complet += texte + "\n\n"
+
+    texte_complet = _normaliser_espaces(texte_complet)
+
+    # Trouver tous les CODE
+    pattern_code = r"CODE\s*:\s*[TC]\s*(\S+)"
+    matches = list(re.finditer(pattern_code, texte_complet))
+
+    tournois = []
+    seen_codes = set()
+
+    for idx, match in enumerate(matches):
+        raw = match.group(1)
+        digits = re.findall(r"\d", raw)
+        if len(digits) < 6:
+            continue
+        code = "".join(digits[-6:])
+
+        if code in seen_codes:
+            continue
+        seen_codes.add(code)
+
+        # Bloc texte : du CODE précédent (ou début) jusqu'à ce CODE
+        debut_bloc = matches[idx - 1].end() if idx > 0 else 0
+        fin_bloc = match.end()
+        bloc = texte_complet[debut_bloc:fin_bloc]
+
+        info = _extraire_infos_pdf_bloc(bloc, code)
+        tournois.append(info)
+
+    return tournois
+
+
+def _extraire_infos_pdf_bloc(bloc, code):
+    """Extrait les infos d'un tournoi depuis un bloc de texte PDF."""
+    info = {
+        "code": code,
+        "url": f"https://tenup.fft.fr/tournoi/{code}",
+        "nom": "",
+        "club": "",
+        "debut": "",
+        "fin": "",
+        "surface": "",
+        "juge_arbitre": "",
+        "lieu": "",
+        "mail": "",
+        "tel": "",
+        "tarif_jeune_pdf": "",
+        "epreuves": [],
+    }
+
+    # Nom du tournoi
+    for p in [
+        r"(?:Nom|Intitul[ée])\s*[:\-]\s*(.+)",
+        r"HOMOLOGATION[^\n]*\n\s*(.+)",
+    ]:
+        m = re.search(p, bloc, re.IGNORECASE)
+        if m and m.group(1).strip():
+            info["nom"] = m.group(1).strip()
+            break
+
+    # Club
+    m = re.search(
+        r"Club(?:\s+organisateur)?\s*[:\-]\s*(.+)", bloc, re.IGNORECASE
+    )
+    if m:
+        info["club"] = m.group(1).strip()
+
+    # Dates — « Du XX/XX/XXXX au XX/XX/XXXX »
+    m = re.search(
+        r"[Dd]u\s+(\d{2}/\d{2}/\d{2,4})\s+au\s+(\d{2}/\d{2}/\d{2,4})", bloc
+    )
+    if m:
+        info["debut"] = m.group(1)
+        info["fin"] = m.group(2)
+    else:
+        m = re.search(
+            r"P[ée]riode\s*[:\-]?\s*(\d{2}/\d{2}/\d{2,4})\s*(?:au|[-\u2013])\s*(\d{2}/\d{2}/\d{2,4})",
+            bloc, re.IGNORECASE,
+        )
+        if m:
+            info["debut"] = m.group(1)
+            info["fin"] = m.group(2)
+        else:
+            m = re.search(
+                r"D[ée]but\s*[:\-]?\s*(\d{2}/\d{2}/\d{2,4})", bloc, re.IGNORECASE
+            )
+            if m:
+                info["debut"] = m.group(1)
+            m2 = re.search(
+                r"Fin\s*[:\-]?\s*(\d{2}/\d{2}/\d{2,4})", bloc, re.IGNORECASE
+            )
+            if m2:
+                info["fin"] = m2.group(1)
+
+    # Surface
+    m = re.search(r"Surface\s*[:\-]\s*(.+)", bloc, re.IGNORECASE)
+    if m:
+        info["surface"] = m.group(1).strip()
+
+    # Juge-Arbitre
+    for p in [
+        r"Juge[\s\-]?[Aa]rbitre\s*[:\-]\s*(.+)",
+        r"JA\s*[:\-]\s*(.+)",
+    ]:
+        m = re.search(p, bloc, re.IGNORECASE)
+        if m and m.group(1).strip():
+            info["juge_arbitre"] = m.group(1).strip()
+            break
+
+    # Lieu
+    m = re.search(r"Lieu\s*[:\-]\s*(.+)", bloc, re.IGNORECASE)
+    if m:
+        info["lieu"] = m.group(1).strip()
+
+    # Email
+    m = re.search(r"[\w.+-]+@[\w.-]+\.\w+", bloc)
+    if m:
+        info["mail"] = m.group(0)
+
+    # Téléphone
+    for p in [
+        r"(?:T[ée]l[ée]?phone|T[ée]l)\s*[:\-.]?\s*([\d\s.]{10,})",
+    ]:
+        m = re.search(p, bloc, re.IGNORECASE)
+        if m:
+            info["tel"] = m.group(1).strip()
+            break
+    if not info["tel"]:
+        m = re.search(
+            r"(?:0[1-9])[\s.]?\d{2}[\s.]?\d{2}[\s.]?\d{2}[\s.]?\d{2}", bloc
+        )
+        if m:
+            info["tel"] = m.group(0).strip()
+
+    # Tarif jeune (du PDF, utilisé comme fallback si l'URL n'a pas le tarif)
+    m = re.search(
+        r"Tarif\s+jeune\s*[:\-]?\s*([\d,.\s]+\s*\u20ac?)", bloc, re.IGNORECASE
+    )
+    if m:
+        info["tarif_jeune_pdf"] = m.group(1).strip()
+    else:
+        m = re.search(
+            r"Tarif\s*[:\-]?\s*([\d,.\s]+\s*\u20ac)", bloc, re.IGNORECASE
+        )
+        if m:
+            info["tarif_jeune_pdf"] = m.group(1).strip()
+
+    return info
+
+
 # ---------------------------------------------------------------------------
 # 2. Récupération du HTML d'une page tournoi
 # ---------------------------------------------------------------------------
@@ -325,6 +489,41 @@ def _fallback_texte(info, texte):
     for champ, pattern in fallbacks.items():
         if not info[champ]:
             info[champ] = _chercher_dans_texte(texte, pattern)
+
+
+def _fusionner_donnees(pdf_info, url_info):
+    """Fusionne les données PDF et URL.
+
+    Stratégie :
+    - Infos générales (nom, club, dates, lieu, etc.) : PDF prioritaire, URL en fallback
+    - Classement, format : URL prioritaire (le PDF dit toujours « Open »)
+    - Tarif : PDF en priorité, URL en fallback
+    - Épreuves : toujours depuis l'URL (seule source pour classement/format)
+    """
+    info = {
+        "code": url_info.get("code") or pdf_info.get("code", ""),
+        "url": url_info.get("url") or pdf_info.get("url", ""),
+        "epreuves": url_info.get("epreuves", []),
+    }
+
+    # Champs généraux : PDF prioritaire, URL en fallback
+    for champ in (
+        "nom", "club", "debut", "fin", "surface",
+        "juge_arbitre", "lieu", "mail", "tel",
+    ):
+        info[champ] = pdf_info.get(champ, "") or url_info.get(champ, "")
+
+    # Tarif : utiliser le tarif PDF comme fallback pour les épreuves
+    tarif_pdf = pdf_info.get("tarif_jeune_pdf", "")
+    for ep in info["epreuves"]:
+        if not ep.get("tarif_jeune") and tarif_pdf:
+            ep["tarif_jeune"] = tarif_pdf
+
+    # Conserver l'erreur éventuelle
+    if url_info.get("erreur"):
+        info["erreur"] = url_info["erreur"]
+
+    return info
 
 
 # ---------------------------------------------------------------------------
@@ -729,14 +928,47 @@ def _mode_test(args):
     if shown == 0:
         print("  (aucune ligne trouvée - le contenu JS n'a probablement pas été chargé)")
 
-    # Lancer le parsing normal
-    print("\n--- RÉSULTAT DU PARSING ---")
-    info = parser_page_tournoi(html, code)
-    print(f"  Nom : {info.get('nom', '(vide)')}")
-    print(f"  Club : {info.get('club', '(vide)')}")
-    print(f"  Début : {info.get('debut', '(vide)')}")
-    print(f"  Fin : {info.get('fin', '(vide)')}")
-    print(f"  Lieu : {info.get('lieu', '(vide)')}")
+    # --- Données PDF (si un PDF est fourni) ---
+    pdf_info = {}
+    if args.pdf:
+        print("\n--- DONNÉES EXTRAITES DU PDF ---")
+        pdf_tournois = extraire_tournois_du_pdf(args.pdf)
+        pdf_data = {t["code"]: t for t in pdf_tournois}
+        pdf_info = pdf_data.get(code, {})
+        if pdf_info:
+            for champ in ("nom", "club", "debut", "fin", "surface",
+                          "juge_arbitre", "lieu", "mail", "tel",
+                          "tarif_jeune_pdf"):
+                val = pdf_info.get(champ, "")
+                label = champ.replace("_", " ").capitalize()
+                print(f"  {label} : {val or '(vide)'}")
+        else:
+            print(f"  Code {code} non trouvé dans le PDF")
+
+    # Lancer le parsing URL
+    print("\n--- RÉSULTAT DU PARSING URL ---")
+    url_info = parser_page_tournoi(html, code)
+    print(f"  Nom : {url_info.get('nom', '(vide)')}")
+    print(f"  Club : {url_info.get('club', '(vide)')}")
+    print(f"  Début : {url_info.get('debut', '(vide)')}")
+    print(f"  Fin : {url_info.get('fin', '(vide)')}")
+    print(f"  Lieu : {url_info.get('lieu', '(vide)')}")
+
+    # Fusionner PDF + URL
+    info = _fusionner_donnees(pdf_info, url_info)
+
+    print("\n--- RÉSULTAT FUSIONNÉ (PDF + URL) ---")
+    for champ in ("nom", "club", "debut", "fin", "surface",
+                  "juge_arbitre", "lieu", "mail", "tel"):
+        val = info.get(champ, "")
+        label = champ.replace("_", " ").capitalize()
+        source = ""
+        if pdf_info.get(champ) and pdf_info[champ] == val:
+            source = " [PDF]"
+        elif url_info.get(champ) and url_info[champ] == val:
+            source = " [URL]"
+        print(f"  {label} : {val or '(vide)'}{source}")
+
     epreuves = info.get("epreuves", [])
     if epreuves:
         print(f"  Épreuves 11/12 ans trouvées : {len(epreuves)}")
@@ -744,8 +976,8 @@ def _mode_test(args):
             print(f"    [{j}] {ep.get('nom_epreuve', '?')}")
             print(f"        Âge : {ep.get('age', '?')}")
             print(f"        Tarif jeune : {ep.get('tarif_jeune', '?')}")
-            print(f"        Classement : {ep.get('classement', '?')}")
-            print(f"        Format : {ep.get('format', '?')}")
+            print(f"        Classement : {ep.get('classement', '?')} [URL]")
+            print(f"        Format : {ep.get('format', '?')} [URL]")
     else:
         print("  AUCUNE ÉPREUVE 11/12 ANS TROUVÉE")
         print()
@@ -791,6 +1023,10 @@ def main():
         help="Sauvegarder le HTML de chaque page dans le dossier debug_html/",
     )
     parser.add_argument(
+        "--debug-pdf", action="store_true",
+        help="Afficher le texte brut extrait du PDF (pour diagnostic)",
+    )
+    parser.add_argument(
         "--test", metavar="CODE",
         help="Tester avec un seul code tournoi et afficher un diagnostic détaillé",
     )
@@ -805,17 +1041,58 @@ def main():
     if not args.pdf and not args.resume:
         parser.error("Fournissez un fichier PDF ou utilisez --resume")
 
-    # Charger ou extraire les codes
+    # Charger ou extraire les codes + infos PDF
+    pdf_data = {}  # code -> info extraite du PDF
     if args.resume and os.path.exists(args.resume):
         print(f"Reprise depuis : {args.resume}")
         tournois, codes = charger_progres(args.resume)
         print(f"  -> {len(tournois)} tournoi(s) déjà traité(s)")
         print(f"  -> {len(codes)} tournoi(s) restant(s)")
+        # Ré-extraire les données PDF si le fichier est fourni
+        if args.pdf:
+            pdf_tournois = extraire_tournois_du_pdf(args.pdf)
+            pdf_data = {t["code"]: t for t in pdf_tournois}
+            print(f"  -> {len(pdf_data)} fiche(s) PDF chargée(s)")
     else:
         print(f"Lecture du PDF : {args.pdf}")
-        codes = extraire_codes_tournois(args.pdf)
-        print(f"  -> {len(codes)} codes de tournoi trouvés")
+        pdf_tournois = extraire_tournois_du_pdf(args.pdf)
+        pdf_data = {t["code"]: t for t in pdf_tournois}
+        codes = [t["code"] for t in pdf_tournois]
+        print(f"  -> {len(codes)} tournoi(s) trouvé(s) dans le PDF")
+        # Afficher les infos PDF extraites en aperçu
+        for t in pdf_tournois[:3]:
+            nom = t.get("nom", "?") or "?"
+            club = t.get("club", "") or ""
+            debut = t.get("debut", "") or ""
+            apercu = f"     {t['code']}: {nom}"
+            if club:
+                apercu += f" ({club})"
+            if debut:
+                apercu += f" - {debut}"
+            print(apercu)
+        if len(pdf_tournois) > 3:
+            print(f"     ... et {len(pdf_tournois) - 3} autre(s)")
         tournois = []
+
+    # Mode debug PDF : afficher le texte brut extrait
+    if args.debug_pdf and args.pdf:
+        reader = PdfReader(args.pdf)
+        print("\n=== DEBUG PDF - TEXTE BRUT ===")
+        for i, page in enumerate(reader.pages, 1):
+            texte = page.extract_text()
+            if texte:
+                print(f"\n--- PAGE {i} ---")
+                print(_normaliser_espaces(texte))
+        print("\n=== FIN DEBUG PDF ===\n")
+        print("Données extraites par tournoi :")
+        for t in pdf_data.values():
+            print(f"\n  Code: {t['code']}")
+            for champ in ("nom", "club", "debut", "fin", "surface",
+                          "juge_arbitre", "lieu", "mail", "tel",
+                          "tarif_jeune_pdf"):
+                val = t.get(champ, "")
+                label = champ.replace("_", " ").capitalize()
+                print(f"    {label}: {val or '(vide)'}")
 
     if not codes and not tournois:
         print("Aucun code de tournoi trouvé.")
@@ -878,16 +1155,21 @@ def main():
                     with open(debug_path, "w", encoding="utf-8") as f:
                         f.write(html)
 
-                info = parser_page_tournoi(html, code)
+                url_info = parser_page_tournoi(html, code)
+                # Fusionner PDF (infos générales) + URL (classement/format)
+                info = _fusionner_donnees(pdf_data.get(code, {}), url_info)
             except Exception as e:
-                info = {
-                    "code": code,
-                    "url": f"https://tenup.fft.fr/tournoi/{code}",
-                    "nom": "", "club": "", "debut": "", "fin": "",
-                    "surface": "", "juge_arbitre": "", "lieu": "",
-                    "mail": "", "tel": "", "epreuves": [],
-                    "erreur": str(e),
-                }
+                # Utiliser les données PDF même si l'URL échoue
+                info = pdf_data.get(code, {}).copy()
+                if not info:
+                    info = {
+                        "code": code,
+                        "url": f"https://tenup.fft.fr/tournoi/{code}",
+                        "nom": "", "club": "", "debut": "", "fin": "",
+                        "surface": "", "juge_arbitre": "", "lieu": "",
+                        "mail": "", "tel": "", "epreuves": [],
+                    }
+                info["erreur"] = f"URL: {e}"
 
             tournois.append(info)
             codes.pop(0)
