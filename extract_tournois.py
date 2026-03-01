@@ -91,19 +91,51 @@ def extraire_tournois_du_pdf(chemin_pdf):
             continue
         seen_codes.add(code)
 
-        # Bloc texte : du CODE précédent (ou début) jusqu'à ce CODE
-        debut_bloc = matches[idx - 1].end() if idx > 0 else 0
-        fin_bloc = match.end()
-        bloc = texte_complet[debut_bloc:fin_bloc]
+        # Bloc AVANT le CODE : header du tournoi (club, nom, dates, juge, surface)
+        debut_avant = matches[idx - 1].end() if idx > 0 else 0
+        bloc_avant = texte_complet[debut_avant:match.start()]
 
-        info = _extraire_infos_pdf_bloc(bloc, code)
+        # Bloc APRÈS le CODE : installations, engagements, tableau des épreuves
+        debut_apres = match.end()
+        fin_apres = (
+            matches[idx + 1].start()
+            if idx < len(matches) - 1
+            else len(texte_complet)
+        )
+        bloc_apres = texte_complet[debut_apres:fin_apres]
+
+        info = _extraire_infos_pdf_bloc(bloc_avant, bloc_apres, code)
         tournois.append(info)
 
     return tournois
 
 
-def _extraire_infos_pdf_bloc(bloc, code):
-    """Extrait les infos d'un tournoi depuis un bloc de texte PDF."""
+def _extraire_infos_pdf_bloc(bloc_avant, bloc_apres, code):
+    """Extrait les infos d'un tournoi depuis les blocs PDF.
+
+    Format réel du PDF FFT :
+        CLUB NAME                         (pas de label)
+        Nom du tournoi                    (pas de label)
+        DD/MM/YYYY au DD/MM/YYYY          (dates sans « Du »)
+        JUGE-ARBITRE : Prénom NOM
+        SURFACE(S) : Type
+        PRIX EN ESPÈCE : …  /  PRIX EN LOTS : …
+        INSCRIPTIONS / PAIEMENT EN LIGNE : Oui / Oui
+        CODE : T …
+
+        INSTALLATIONS :  CodePostal_VILLE
+                         Adresse
+                         CodePostal VILLE
+                         Téléphone
+
+        ENGAGEMENTS :    email@...
+
+        Catégorie  Epreuve           Classement  Droits
+        11/12      Simple Messieurs  Open        16€
+
+    bloc_avant = texte entre le CODE précédent et ce CODE
+    bloc_apres = texte entre ce CODE et le CODE suivant
+    """
     info = {
         "code": code,
         "url": f"https://tenup.fft.fr/tournoi/{code}",
@@ -120,102 +152,111 @@ def _extraire_infos_pdf_bloc(bloc, code):
         "epreuves": [],
     }
 
-    # Nom du tournoi
-    for p in [
-        r"(?:Nom|Intitul[ée])\s*[:\-]\s*(.+)",
-        r"HOMOLOGATION[^\n]*\n\s*(.+)",
-    ]:
-        m = re.search(p, bloc, re.IGNORECASE)
-        if m and m.group(1).strip():
-            info["nom"] = m.group(1).strip()
-            break
+    # =========================================================
+    # BLOC AVANT : header du tournoi
+    # =========================================================
 
-    # Club
+    # Dates : "DD/MM/YYYY au DD/MM/YYYY" (dernière occurrence du bloc)
+    date_matches = re.findall(
+        r"(\d{2}/\d{2}/\d{2,4})\s+au\s+(\d{2}/\d{2}/\d{2,4})", bloc_avant
+    )
+    if date_matches:
+        info["debut"], info["fin"] = date_matches[-1]
+
+    # Club et Nom : les 2 lignes non-vides juste avant la ligne de dates
+    m_date = None
+    for m_date in re.finditer(
+        r"(\d{2}/\d{2}/\d{2,4})\s+au\s+(\d{2}/\d{2}/\d{2,4})", bloc_avant
+    ):
+        pass  # on veut la dernière occurrence
+    if m_date:
+        text_before_date = bloc_avant[:m_date.start()]
+        lignes = [l.strip() for l in text_before_date.split("\n") if l.strip()]
+        # Filtrer les lignes de bruit (numéros de page, séparateurs, lignes trop courtes)
+        lignes = [
+            l for l in lignes
+            if len(l) > 3
+            and not re.match(r"^\d+$", l)
+            and not re.match(r"^[-=_]+$", l)
+            and not re.match(r"^Page\s", l, re.IGNORECASE)
+        ]
+        if len(lignes) >= 2:
+            info["club"] = lignes[-2]
+            info["nom"] = lignes[-1]
+        elif len(lignes) == 1:
+            info["nom"] = lignes[-1]
+
+    # JUGE-ARBITRE : Prénom NOM (dernière occurrence)
+    juge_matches = re.findall(
+        r"JUGE[\s-]?ARBITRE\s*:\s*(.+)", bloc_avant, re.IGNORECASE
+    )
+    if juge_matches:
+        info["juge_arbitre"] = juge_matches[-1].strip()
+
+    # SURFACE(S) : Type (dernière occurrence)
+    surf_matches = re.findall(
+        r"SURFACE\(?S?\)?\s*:\s*(.+)", bloc_avant, re.IGNORECASE
+    )
+    if surf_matches:
+        info["surface"] = surf_matches[-1].strip()
+
+    # =========================================================
+    # BLOC APRÈS : installations, engagements, tableau
+    # =========================================================
+
+    # INSTALLATIONS : adresse, ville, téléphone
     m = re.search(
-        r"Club(?:\s+organisateur)?\s*[:\-]\s*(.+)", bloc, re.IGNORECASE
+        r"INSTALLATIONS?\s*:\s*(.+?)(?=ENGAGEMENTS?|Cat[ée]gorie|\Z)",
+        bloc_apres, re.DOTALL | re.IGNORECASE,
     )
     if m:
-        info["club"] = m.group(1).strip()
+        bloc_install = m.group(1)
 
-    # Dates — « Du XX/XX/XXXX au XX/XX/XXXX »
-    m = re.search(
-        r"[Dd]u\s+(\d{2}/\d{2}/\d{2,4})\s+au\s+(\d{2}/\d{2}/\d{2,4})", bloc
-    )
-    if m:
-        info["debut"] = m.group(1)
-        info["fin"] = m.group(2)
-    else:
-        m = re.search(
-            r"P[ée]riode\s*[:\-]?\s*(\d{2}/\d{2}/\d{2,4})\s*(?:au|[-\u2013])\s*(\d{2}/\d{2}/\d{2,4})",
-            bloc, re.IGNORECASE,
+        # Lieu : code postal + ville (prendre la version la plus complète)
+        lieux = re.findall(r"(\d{5})\s+([A-ZÀ-Ü][A-ZÀ-Ü\s]+)", bloc_install)
+        if lieux:
+            # Prendre le match le plus long (souvent le 2e, non tronqué)
+            cp, ville = max(lieux, key=lambda x: len(x[1]))
+            info["lieu"] = f"{ville.strip()} ({cp})"
+
+        # Téléphone dans le bloc installations
+        m_tel = re.search(
+            r"((?:0[1-9])[\s.]?\d{2}[\s.]?\d{2}[\s.]?\d{2}[\s.]?\d{2})",
+            bloc_install,
         )
+        if m_tel:
+            info["tel"] = m_tel.group(1).strip()
+
+    # ENGAGEMENTS : email
+    m = re.search(
+        r"ENGAGEMENTS?\s*:?\s*([\w.+-]+@[\w.-]+\.\w+)",
+        bloc_apres, re.IGNORECASE,
+    )
+    if m:
+        info["mail"] = m.group(1).strip()
+    if not info["mail"]:
+        m = re.search(r"[\w.+-]+@[\w.-]+\.\w+", bloc_apres)
         if m:
-            info["debut"] = m.group(1)
-            info["fin"] = m.group(2)
-        else:
-            m = re.search(
-                r"D[ée]but\s*[:\-]?\s*(\d{2}/\d{2}/\d{2,4})", bloc, re.IGNORECASE
-            )
+            info["mail"] = m.group(0)
+
+    # Tableau des épreuves : tarif (colonne « Droits »)
+    # Chercher une ligne contenant "11" + "Simple Messieurs" + montant €
+    for line in bloc_apres.split("\n"):
+        if re.search(r"\b11\b", line) and re.search(
+            r"Simple\s+Messieurs|SM\b", line, re.IGNORECASE
+        ):
+            m = re.search(r"(\d+[.,]?\d*\s*\u20ac)", line)
             if m:
-                info["debut"] = m.group(1)
-            m2 = re.search(
-                r"Fin\s*[:\-]?\s*(\d{2}/\d{2}/\d{2,4})", bloc, re.IGNORECASE
-            )
-            if m2:
-                info["fin"] = m2.group(1)
-
-    # Surface
-    m = re.search(r"Surface\s*[:\-]\s*(.+)", bloc, re.IGNORECASE)
-    if m:
-        info["surface"] = m.group(1).strip()
-
-    # Juge-Arbitre
-    for p in [
-        r"Juge[\s\-]?[Aa]rbitre\s*[:\-]\s*(.+)",
-        r"JA\s*[:\-]\s*(.+)",
-    ]:
-        m = re.search(p, bloc, re.IGNORECASE)
-        if m and m.group(1).strip():
-            info["juge_arbitre"] = m.group(1).strip()
-            break
-
-    # Lieu
-    m = re.search(r"Lieu\s*[:\-]\s*(.+)", bloc, re.IGNORECASE)
-    if m:
-        info["lieu"] = m.group(1).strip()
-
-    # Email
-    m = re.search(r"[\w.+-]+@[\w.-]+\.\w+", bloc)
-    if m:
-        info["mail"] = m.group(0)
-
-    # Téléphone
-    for p in [
-        r"(?:T[ée]l[ée]?phone|T[ée]l)\s*[:\-.]?\s*([\d\s.]{10,})",
-    ]:
-        m = re.search(p, bloc, re.IGNORECASE)
-        if m:
-            info["tel"] = m.group(1).strip()
-            break
-    if not info["tel"]:
-        m = re.search(
-            r"(?:0[1-9])[\s.]?\d{2}[\s.]?\d{2}[\s.]?\d{2}[\s.]?\d{2}", bloc
-        )
-        if m:
-            info["tel"] = m.group(0).strip()
-
-    # Tarif jeune (du PDF, utilisé comme fallback si l'URL n'a pas le tarif)
-    m = re.search(
-        r"Tarif\s+jeune\s*[:\-]?\s*([\d,.\s]+\s*\u20ac?)", bloc, re.IGNORECASE
-    )
-    if m:
-        info["tarif_jeune_pdf"] = m.group(1).strip()
-    else:
-        m = re.search(
-            r"Tarif\s*[:\-]?\s*([\d,.\s]+\s*\u20ac)", bloc, re.IGNORECASE
-        )
-        if m:
-            info["tarif_jeune_pdf"] = m.group(1).strip()
+                info["tarif_jeune_pdf"] = m.group(1).strip()
+                break
+    # Fallback : première ligne avec "11" et un montant €
+    if not info["tarif_jeune_pdf"]:
+        for line in bloc_apres.split("\n"):
+            if re.search(r"\b11\b", line):
+                m = re.search(r"(\d+[.,]?\d*\s*\u20ac)", line)
+                if m:
+                    info["tarif_jeune_pdf"] = m.group(1).strip()
+                    break
 
     return info
 
