@@ -665,27 +665,58 @@ def _extraire_epreuves(soup, texte_complet):
     Couvre tous les types (Simple Messieurs, Simple Mixte, TMC Garçons...).
     Retourne une liste avec au plus 1 épreuve par tournoi.
     """
-    # Stratégie DOM : Chercher le badge "SM" puis vérifier l'âge 11
+    # Stratégie 1 DOM : Chercher le badge "SM" puis remonter au plus haut
+    # ancêtre valide (nb_sm <= 1 et contient âge 11).
+    # On prend le plus haut pour avoir la carte complète (avec Classement/Format).
     sm_badges = soup.find_all(string=re.compile(r"^\s*SM\s*$"))
 
     for badge_text in sm_badges:
         bloc = badge_text.find_parent()
+        best_bloc = None
         for _ in range(15):
             if bloc is None or bloc.name in ("body", "html", "[document]"):
                 break
             bloc_text = bloc.get_text()
+            nb_sm = len(re.findall(r"\bSM\b", bloc_text))
+            if nb_sm > 1:
+                break
             if _bloc_contient_age_11(bloc_text):
-                # Vérifier qu'on n'est pas remonté dans un bloc trop large
-                nb_sm = len(re.findall(r"\bSM\b", bloc_text))
-                if nb_sm <= 1:
-                    epreuve = _extraire_details_epreuve(bloc)
-                    if epreuve:
-                        return [epreuve]
-                else:
+                best_bloc = bloc
+            bloc = bloc.parent
+
+        if best_bloc:
+            epreuve = _extraire_details_epreuve(best_bloc)
+            if epreuve:
+                return [epreuve]
+
+    # Stratégie 2 DOM : Chercher "Simple Messieurs" (pour les pages où le
+    # badge SM n'est pas dans un noeud texte isolé).
+    sm_elements = soup.find_all(
+        string=re.compile(r"Simple\s+Messieurs", re.IGNORECASE)
+    )
+    for el_text in sm_elements:
+        bloc = el_text.find_parent()
+        best_bloc = None
+        for _ in range(10):
+            if bloc is None or bloc.name in ("body", "html", "[document]"):
+                break
+            bloc_text = bloc.get_text()
+            if _bloc_contient_age_11(bloc_text):
+                nb_simple = len(re.findall(
+                    r"Simple\s+Messieurs", bloc_text, re.IGNORECASE
+                ))
+                if nb_simple <= 1:
+                    best_bloc = bloc
+                elif nb_simple > 3:
                     break
             bloc = bloc.parent
 
-    # Fallback texte brut : chercher "SM" + âge 11
+        if best_bloc:
+            epreuve = _extraire_details_epreuve(best_bloc)
+            if epreuve:
+                return [epreuve]
+
+    # Stratégie 3 : Fallback texte brut
     epreuves = _extraire_epreuves_depuis_texte(texte_complet)
     if epreuves:
         return [epreuves[0]]
@@ -713,10 +744,39 @@ def _extraire_details_epreuve(bloc):
         if match:
             epreuve["tarif_jeune"] = match.group(1).strip()
 
-    # Classement
+    # Classement - essayer plusieurs patterns car label et valeur peuvent être
+    # sur des lignes séparées dans le DOM
     match = re.search(r"Classement\s*:?\s*(.+?)(?:\n|$)", texte, re.IGNORECASE)
     if match and match.group(1).strip():
         epreuve["classement"] = match.group(1).strip()
+    if "classement" not in epreuve:
+        # Label "Classement" seul sur une ligne, valeur sur la ligne suivante
+        match = re.search(
+            r"Classement\s*:?\s*\n+\s*(.+?)(?:\n|$)", texte, re.IGNORECASE
+        )
+        if match and match.group(1).strip():
+            epreuve["classement"] = match.group(1).strip()
+    if "classement" not in epreuve:
+        # Chercher directement dans les éléments DOM enfants
+        classement_el = bloc.find(
+            string=re.compile(r"^\s*Classement\s*:?\s*$", re.IGNORECASE)
+        )
+        if classement_el:
+            parent = classement_el.find_parent()
+            if parent:
+                sibling = parent.find_next_sibling()
+                if sibling:
+                    val = sibling.get_text(strip=True)
+                    if val:
+                        epreuve["classement"] = val
+                if "classement" not in epreuve:
+                    parent_text = parent.get_text(strip=True)
+                    cleaned = re.sub(
+                        r"^Classement\s*:?\s*", "", parent_text,
+                        flags=re.IGNORECASE,
+                    )
+                    if cleaned:
+                        epreuve["classement"] = cleaned
 
     # Format - essayer plusieurs patterns car label et valeur peuvent être
     # sur des lignes séparées dans le DOM
@@ -820,6 +880,13 @@ def _extraire_epreuves_depuis_texte(texte):
                 )
                 if match and match.group(1).strip():
                     epreuve["classement"] = match.group(1).strip()
+                if "classement" not in epreuve:
+                    match = re.search(
+                        r"Classement\s*:?\s*\n+\s*(.+?)(?:\n|$)", bloc,
+                        re.IGNORECASE,
+                    )
+                    if match and match.group(1).strip():
+                        epreuve["classement"] = match.group(1).strip()
 
                 match = re.search(
                     r"Format\s*:\s*(.+?)(?:\n|$)", bloc, re.IGNORECASE
