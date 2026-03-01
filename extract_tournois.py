@@ -4,8 +4,13 @@ Extracteur de tournois FFT depuis un PDF et le site tenup.fft.fr
 
 Usage:
     python extract_tournois.py <fichier_pdf> [--output fichier.xlsx] [--delay 1.0]
-    python extract_tournois.py <fichier_pdf> --selenium   # si le site nécessite JavaScript
-    python extract_tournois.py --resume sauvegarde.json   # reprendre une extraction interrompue
+    python extract_tournois.py <fichier_pdf> --playwright  # RECOMMANDÉ (le site nécessite JS)
+    python extract_tournois.py <fichier_pdf> --selenium    # alternative avec Selenium
+    python extract_tournois.py --resume sauvegarde.json    # reprendre une extraction interrompue
+
+Installation (Playwright - recommandé):
+    pip install playwright
+    playwright install chromium
 """
 
 import argparse
@@ -96,6 +101,53 @@ def _creer_driver_selenium():
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     )
     return webdriver.Chrome(options=options)
+
+
+# --- Playwright ---
+
+def _creer_playwright():
+    """Crée un navigateur Playwright Chromium en mode headless."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("ERREUR: playwright n'est pas installé.")
+        print("Installez-le avec :")
+        print("  pip install playwright")
+        print("  playwright install chromium")
+        sys.exit(1)
+
+    pw = sync_playwright().start()
+    browser = pw.chromium.launch(headless=True)
+    context = browser.new_context(
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        locale="fr-FR",
+    )
+    page = context.new_page()
+    return pw, browser, page
+
+
+def _fetch_html_playwright(url, page, timeout=15000):
+    """Récupère le HTML via Playwright avec attente du contenu dynamique."""
+    page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    # Attendre que le contenu du tournoi soit chargé.
+    # On attend que le réseau soit calme (plus de requêtes XHR en cours).
+    try:
+        page.wait_for_load_state("networkidle", timeout=timeout)
+    except Exception:
+        pass
+    # Vérifier si le contenu est apparu (texte typique d'une page tournoi)
+    try:
+        page.wait_for_selector(
+            "text=Simple Messieurs", timeout=5000,
+        )
+    except Exception:
+        # Dernier recours : attendre un délai fixe
+        page.wait_for_timeout(3000)
+    return page.content()
 
 
 # ---------------------------------------------------------------------------
@@ -479,6 +531,10 @@ def main():
         help="Délai en secondes entre chaque requête (défaut: 1.0)",
     )
     parser.add_argument(
+        "--playwright", action="store_true",
+        help="Utiliser Playwright (Chromium headless) - RECOMMANDÉ pour tenup.fft.fr",
+    )
+    parser.add_argument(
         "--selenium", action="store_true",
         help="Utiliser Selenium (Chrome headless) au lieu de requests",
     )
@@ -517,11 +573,17 @@ def main():
     # Préparer le mode de fetch
     driver = None
     session = None
-    if args.selenium:
+    pw = None
+    browser = None
+    pw_page = None
+    if args.playwright:
+        print("Mode Playwright (Chromium headless) - recommandé")
+        pw, browser, pw_page = _creer_playwright()
+    elif args.selenium:
         print("Mode Selenium (Chrome headless)")
         driver = _creer_driver_selenium()
     else:
-        print("Mode requests")
+        print("Mode requests (ATTENTION: tenup.fft.fr nécessite JS, utilisez --playwright)")
         session = requests.Session()
         session.headers.update({
             "User-Agent": (
@@ -544,14 +606,13 @@ def main():
             time.sleep(args.delay)
 
             try:
-                if args.selenium:
-                    html = _fetch_html_selenium(
-                        f"https://tenup.fft.fr/tournoi/{code}", driver
-                    )
+                url = f"https://tenup.fft.fr/tournoi/{code}"
+                if args.playwright:
+                    html = _fetch_html_playwright(url, pw_page)
+                elif args.selenium:
+                    html = _fetch_html_selenium(url, driver)
                 else:
-                    html = _fetch_html_requests(
-                        f"https://tenup.fft.fr/tournoi/{code}", session
-                    )
+                    html = _fetch_html_requests(url, session)
 
                 info = parser_page_tournoi(html, code)
             except Exception as e:
@@ -592,6 +653,10 @@ def main():
     finally:
         if driver:
             driver.quit()
+        if browser:
+            browser.close()
+        if pw:
+            pw.stop()
 
     # Sauvegarde finale
     sauvegarder_progres(tournois, [], args.save)
