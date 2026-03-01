@@ -133,61 +133,48 @@ def _creer_playwright():
 def _fetch_html_playwright(url, page, timeout=15000):
     """Récupère le HTML via Playwright avec attente du contenu dynamique."""
     page.goto(url, wait_until="domcontentloaded", timeout=30000)
-    # Attendre que le contenu du tournoi soit chargé.
-    # On attend que le réseau soit calme (plus de requêtes XHR en cours).
+    # Attendre que le réseau soit calme (plus de requêtes XHR en cours).
     try:
         page.wait_for_load_state("networkidle", timeout=timeout)
     except Exception:
         pass
-    # Vérifier si le contenu est apparu (texte typique d'une page tournoi)
-    # Cherche n'importe quel texte lié aux épreuves (pas juste "Simple Messieurs")
+
+    # Attendre que les épreuves soient chargées (contenu dynamique JS).
+    # On cherche "Simple Messieurs" ou "Âge" qui indiquent que les cartes
+    # d'épreuves sont rendues.
     selectors_to_try = [
-        "text=/11.?12/i",           # "11/12" dans n'importe quel format
-        "text=/Simple/i",            # "Simple Messieurs" ou "Simple Garçons"
-        "text=/preuve/i",            # "Épreuve" ou "épreuve"
-        "text=/tableau/i",           # "Tableau"
+        "text=/Simple Messieurs/i",
+        "text=/Simple/i",
+        "text=/11.?12/i",
+        "text=/ge.*:/i",             # "Âge :" (avec ou sans accent)
     ]
     content_found = False
     for selector in selectors_to_try:
         try:
-            page.wait_for_selector(selector, timeout=3000)
+            page.wait_for_selector(selector, timeout=5000)
             content_found = True
             break
         except Exception:
             continue
     if not content_found:
-        page.wait_for_timeout(3000)
+        # Dernier recours : attendre 5 secondes supplémentaires
+        page.wait_for_timeout(5000)
 
-    # Cliquer sur les onglets/tabs pour charger toutes les épreuves
+    # Cliquer sur d'éventuels onglets/accordéons pour révéler du contenu caché
     _cliquer_onglets_epreuves(page)
 
     return page.content()
 
 
 def _cliquer_onglets_epreuves(page):
-    """Clique sur les onglets/tabs pour charger les sections des épreuves."""
-    # Chercher les onglets qui pourraient contenir "11/12", "épreuves", etc.
+    """Clique sur les onglets/tabs/accordéons pour charger les épreuves cachées."""
     tab_selectors = [
-        # Onglets génériques
+        "[aria-expanded='false']",
         "button:has-text('preuve')",
         "a:has-text('preuve')",
-        "[role='tab']:has-text('preuve')",
-        # Onglets liés à l'âge / catégorie
-        "button:has-text('11/12')",
-        "a:has-text('11/12')",
-        "[role='tab']:has-text('11/12')",
-        # Onglets "Tableau"
-        "button:has-text('Tableau')",
-        "a:has-text('Tableau')",
-        "[role='tab']:has-text('Tableau')",
-        # "Voir plus" ou "Afficher tout"
         "button:has-text('Voir')",
         "a:has-text('Voir plus')",
         "button:has-text('Afficher')",
-        # Accordéons / expand
-        "[aria-expanded='false']",
-        ".accordion-header",
-        ".expand",
     ]
     for selector in tab_selectors:
         try:
@@ -206,8 +193,17 @@ def _cliquer_onglets_epreuves(page):
 # 3. Parsing du HTML d'un tournoi
 # ---------------------------------------------------------------------------
 
+def _normaliser_espaces(texte):
+    """Remplace les espaces insécables et autres espaces Unicode par des espaces normaux."""
+    # \xa0 = espace insécable, \u202f = espace fine insécable, etc.
+    return re.sub(r"[\xa0\u202f\u2007\u2009\u200a]", " ", texte)
+
+
 def parser_page_tournoi(html, code):
     """Parse le HTML d'une page tournoi et retourne les infos structurées."""
+    # Normaliser les espaces insécables dans tout le HTML
+    html = _normaliser_espaces(html)
+
     url = f"https://tenup.fft.fr/tournoi/{code}"
     info = {
         "code": code,
@@ -708,6 +704,119 @@ def charger_progres(chemin_json):
 # 7. Fonction principale
 # ---------------------------------------------------------------------------
 
+def _mode_test(args):
+    """Mode test : analyse un seul tournoi et affiche un diagnostic complet."""
+    code = args.test
+    url = f"https://tenup.fft.fr/tournoi/{code}"
+    print(f"=== MODE TEST - Tournoi {code} ===")
+    print(f"URL : {url}")
+    print()
+
+    # Préparer le fetch
+    pw = browser = pw_page = driver = session = None
+    try:
+        if args.playwright:
+            print("Mode : Playwright (Chromium headless)")
+            pw, browser, pw_page = _creer_playwright()
+            html = _fetch_html_playwright(url, pw_page)
+        elif args.selenium:
+            print("Mode : Selenium")
+            driver = _creer_driver_selenium()
+            html = _fetch_html_selenium(url, driver)
+        else:
+            print("Mode : requests")
+            print("ATTENTION : tenup.fft.fr nécessite JavaScript !")
+            print("           Utilisez --playwright pour un résultat fiable.")
+            session = requests.Session()
+            session.headers.update({
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36"
+                ),
+            })
+            html = _fetch_html_requests(url, session)
+    finally:
+        if browser:
+            browser.close()
+        if pw:
+            pw.stop()
+        if driver:
+            driver.quit()
+
+    print(f"\nHTML récupéré : {len(html)} caractères")
+
+    # Sauvegarder le HTML
+    debug_file = f"debug_tournoi_{code}.html"
+    with open(debug_file, "w", encoding="utf-8") as f:
+        f.write(html)
+    print(f"HTML sauvegardé dans : {debug_file}")
+
+    # Analyser le contenu brut
+    soup = BeautifulSoup(html, "html.parser")
+    texte = _normaliser_espaces(soup.get_text(separator="\n"))
+
+    # Diagnostic : chercher les mots-clés attendus
+    print("\n--- DIAGNOSTIC DU CONTENU ---")
+    mots_cles = [
+        "Simple Messieurs",
+        "Simple Garçons",
+        "(TS)",
+        "11/12",
+        "11/12 ans",
+        "Âge",
+        "Age",
+        "Tarif jeune",
+        "Classement",
+        "Format",
+    ]
+    for mot in mots_cles:
+        count = texte.lower().count(mot.lower())
+        status = f"TROUVÉ ({count}x)" if count > 0 else "ABSENT"
+        print(f"  '{mot}' : {status}")
+
+    # Montrer les lignes contenant "Simple" ou "11/12"
+    print("\n--- LIGNES CONTENANT 'Simple' ou '11/12' ---")
+    lines = texte.split("\n")
+    shown = 0
+    for i, line in enumerate(lines):
+        line_stripped = line.strip()
+        if not line_stripped:
+            continue
+        if re.search(r"simple|11.?12|[âa]ge\s*:", line, re.IGNORECASE):
+            print(f"  L{i}: {line_stripped[:120]}")
+            shown += 1
+            if shown >= 30:
+                print("  ... (tronqué)")
+                break
+    if shown == 0:
+        print("  (aucune ligne trouvée - le contenu JS n'a probablement pas été chargé)")
+
+    # Lancer le parsing normal
+    print("\n--- RÉSULTAT DU PARSING ---")
+    info = parser_page_tournoi(html, code)
+    print(f"  Nom : {info.get('nom', '(vide)')}")
+    print(f"  Club : {info.get('club', '(vide)')}")
+    print(f"  Début : {info.get('debut', '(vide)')}")
+    print(f"  Fin : {info.get('fin', '(vide)')}")
+    print(f"  Lieu : {info.get('lieu', '(vide)')}")
+    epreuves = info.get("epreuves", [])
+    if epreuves:
+        print(f"  Épreuves 11/12 ans trouvées : {len(epreuves)}")
+        for j, ep in enumerate(epreuves, 1):
+            print(f"    [{j}] {ep.get('nom_epreuve', '?')}")
+            print(f"        Âge : {ep.get('age', '?')}")
+            print(f"        Tarif jeune : {ep.get('tarif_jeune', '?')}")
+            print(f"        Classement : {ep.get('classement', '?')}")
+            print(f"        Format : {ep.get('format', '?')}")
+    else:
+        print("  AUCUNE ÉPREUVE 11/12 ANS TROUVÉE")
+        print()
+        print("  Conseils :")
+        print("  - Vérifiez le fichier debug_tournoi_{}.html".format(code))
+        print("  - Si le fichier HTML est presque vide, le JS n'a pas été chargé")
+        print("  - Essayez avec --playwright si ce n'est pas déjà fait")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Extrait les informations de tournois FFT depuis un PDF"
@@ -743,7 +852,16 @@ def main():
         "--debug", action="store_true",
         help="Sauvegarder le HTML de chaque page dans le dossier debug_html/",
     )
+    parser.add_argument(
+        "--test", metavar="CODE",
+        help="Tester avec un seul code tournoi et afficher un diagnostic détaillé",
+    )
     args = parser.parse_args()
+
+    # Mode test : tester un seul tournoi avec diagnostic détaillé
+    if args.test:
+        _mode_test(args)
+        return
 
     # Vérifications des arguments
     if not args.pdf and not args.resume:
