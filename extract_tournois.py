@@ -143,7 +143,7 @@ def _fetch_html_playwright(url, page, timeout=15000):
     # On cherche "Simple Messieurs" ou "Âge" qui indiquent que les cartes
     # d'épreuves sont rendues.
     selectors_to_try = [
-        "text=/Simple Messieurs/i",
+        "text=/^SM$/",               # Badge SM
         "text=/Simple/i",
         "text=/11.?12/i",
         "text=/ge.*:/i",             # "Âge :" (avec ou sans accent)
@@ -331,55 +331,57 @@ def _fallback_texte(info, texte):
 # 4. Extraction des épreuves correspondantes
 # ---------------------------------------------------------------------------
 
-def _extraire_epreuves(soup, texte_complet):
-    """Extrait l'épreuve Simple Messieurs (TS) avec Âge 11/12 ans.
+def _bloc_contient_age_11(bloc_text):
+    """Vérifie si un bloc contient un âge avec '11' (11, 11/12, 11-12)."""
+    # Âge : 11/12 ans, Âge : 11 ans, Âge:11/12, etc.
+    if re.search(r"[ÂA]ge\s*:?\s*[^\n]*11", bloc_text, re.IGNORECASE):
+        return True
+    # "11/12 ans" ou "11-12 ans" dans le texte libre (titre d'épreuve)
+    if re.search(r"11\s*[/\-]\s*12", bloc_text, re.IGNORECASE):
+        return True
+    # "11 ans" isolé
+    if re.search(r"\b11\s*ans\b", bloc_text, re.IGNORECASE):
+        return True
+    return False
 
+
+def _extraire_epreuves(soup, texte_complet):
+    """Extrait l'épreuve avec badge SM et âge contenant 11.
+
+    Règle simple : badge "SM" + âge avec "11".
+    Couvre tous les types (Simple Messieurs, Simple Mixte, TMC Garçons...).
     Retourne une liste avec au plus 1 épreuve par tournoi.
     """
-    # Stratégie 1 : Chercher chaque "Simple Messieurs" dans le DOM
-    # et vérifier si le bloc parent contient "11/12 ans"
-    sm_elements = soup.find_all(
-        string=re.compile(r"Simple\s+Messieurs", re.IGNORECASE)
-    )
+    # Stratégie DOM : Chercher le badge "SM" puis vérifier l'âge 11
+    sm_badges = soup.find_all(string=re.compile(r"^\s*SM\s*$"))
 
-    for sm_text in sm_elements:
-        # Remonter dans le DOM pour trouver le bloc de l'épreuve
-        bloc = sm_text.find_parent()
+    for badge_text in sm_badges:
+        bloc = badge_text.find_parent()
         for _ in range(15):
             if bloc is None or bloc.name in ("body", "html", "[document]"):
                 break
             bloc_text = bloc.get_text()
-            # Vérifier que ce bloc contient "11/12" dans un champ Âge
-            has_age_11_12 = re.search(
-                r"[ÂA]ge\s*:?\s*11\s*[/\-]\s*12",
-                bloc_text, re.IGNORECASE,
-            )
-            if has_age_11_12:
-                # Vérifier que ce bloc ne contient PAS d'autres catégories d'âge
-                # (sinon on est remonté trop haut et on a un bloc parent global)
-                nb_ages = len(re.findall(
-                    r"[ÂA]ge\s*:", bloc_text, re.IGNORECASE
-                ))
-                if nb_ages <= 1:
-                    # Bloc spécifique à cette épreuve
+            if _bloc_contient_age_11(bloc_text):
+                # Vérifier qu'on n'est pas remonté dans un bloc trop large
+                nb_sm = len(re.findall(r"\bSM\b", bloc_text))
+                if nb_sm <= 1:
                     epreuve = _extraire_details_epreuve(bloc)
                     if epreuve:
                         return [epreuve]
                 else:
-                    # On est dans un bloc trop large, essayer de remonter moins
                     break
             bloc = bloc.parent
 
-    # Stratégie 2 : analyse du texte brut ligne par ligne
+    # Fallback texte brut : chercher "SM" + âge 11
     epreuves = _extraire_epreuves_depuis_texte(texte_complet)
     if epreuves:
-        return [epreuves[0]]  # Au plus 1 résultat
+        return [epreuves[0]]
 
     return []
 
 
 def _extraire_details_epreuve(bloc):
-    """Extrait tarif, classement, format depuis un bloc HTML d'épreuve."""
+    """Extrait tarif, classement, format, âge et nom depuis un bloc HTML d'épreuve."""
     texte = bloc.get_text(separator="\n")
     epreuve = {}
 
@@ -391,9 +393,8 @@ def _extraire_details_epreuve(bloc):
         match = re.search(
             r"Tarif\s+jeune\s*:?\s*(.+?)(?:\n|$)", texte, re.IGNORECASE
         )
-        if match:
+        if match and match.group(1).strip():
             epreuve["tarif_jeune"] = match.group(1).strip()
-    # Fallback : tarif générique
     if "tarif_jeune" not in epreuve:
         match = re.search(r"Tarif\s*:?\s*([\d,]+\s*€)", texte, re.IGNORECASE)
         if match:
@@ -401,61 +402,99 @@ def _extraire_details_epreuve(bloc):
 
     # Classement
     match = re.search(r"Classement\s*:?\s*(.+?)(?:\n|$)", texte, re.IGNORECASE)
-    if match:
+    if match and match.group(1).strip():
         epreuve["classement"] = match.group(1).strip()
 
-    # Format
-    match = re.search(r"Format\s*:?\s*(.+?)(?:\n|$)", texte, re.IGNORECASE)
-    if match:
+    # Format - essayer plusieurs patterns car label et valeur peuvent être
+    # sur des lignes séparées dans le DOM
+    match = re.search(r"Format\s*:\s*(.+?)(?:\n|$)", texte, re.IGNORECASE)
+    if match and match.group(1).strip():
         epreuve["format"] = match.group(1).strip()
+    else:
+        # Label "Format" seul sur une ligne, valeur sur la ligne suivante
+        match = re.search(
+            r"Format\s*:?\s*\n+\s*(.+?)(?:\n|$)", texte, re.IGNORECASE
+        )
+        if match and match.group(1).strip():
+            epreuve["format"] = match.group(1).strip()
+    if "format" not in epreuve:
+        # Chercher directement dans les éléments DOM enfants
+        format_el = bloc.find(string=re.compile(r"^\s*Format\s*:?\s*$", re.IGNORECASE))
+        if format_el:
+            parent = format_el.find_parent()
+            if parent:
+                # Valeur dans un élément frère
+                sibling = parent.find_next_sibling()
+                if sibling:
+                    val = sibling.get_text(strip=True)
+                    if val:
+                        epreuve["format"] = val
+                # Valeur dans le même parent après le label
+                if "format" not in epreuve:
+                    parent_text = parent.get_text(strip=True)
+                    cleaned = re.sub(r"^Format\s*:?\s*", "", parent_text, flags=re.IGNORECASE)
+                    if cleaned:
+                        epreuve["format"] = cleaned
 
     # Âge
     match = re.search(r"[ÂA]ge\s*:?\s*(.+?)(?:\n|$)", texte, re.IGNORECASE)
-    if match:
+    if match and match.group(1).strip():
         epreuve["age"] = match.group(1).strip()
-    # Fallback : chercher "11/12 ans" directement
     if "age" not in epreuve:
+        # Chercher "11/12 ans" ou "11 ans" directement
         match = re.search(r"(11\s*[/\-]\s*12\s*ans)", texte, re.IGNORECASE)
         if match:
             epreuve["age"] = match.group(1).strip()
+        else:
+            match = re.search(r"(11\s*ans)", texte, re.IGNORECASE)
+            if match:
+                epreuve["age"] = match.group(1).strip()
 
-    # Nom de l'épreuve - Simple Messieurs uniquement
-    match = re.search(
-        r"(Simple\s+Messieurs\s*(?:\(TS\))?.*?)(?:\n|$)", texte, re.IGNORECASE
-    )
-    if match:
-        epreuve["nom_epreuve"] = match.group(1).strip()
+    # Nom de l'épreuve : première ligne significative (pas le badge, pas un champ)
+    for line in texte.split("\n"):
+        line_s = line.strip()
+        if (line_s
+                and line_s not in ("SM", "SD")
+                and not re.match(
+                    r"^([ÂA]ge|Format|Classement|Tarif|Inscription)\s*:",
+                    line_s, re.IGNORECASE)):
+            epreuve["nom_epreuve"] = line_s
+            break
 
     return epreuve if epreuve else None
 
 
 def _extraire_epreuves_depuis_texte(texte):
-    """Fallback : extraction depuis le texte brut de la page.
-
-    Cherche chaque bloc "Simple Messieurs" et vérifie si son Âge est 11/12.
-    Ne regarde que les lignes entre ce "Simple Messieurs" et le prochain
-    "Simple " (Dames/Messieurs suivant) pour éviter les faux positifs.
-    """
-    epreuves = []
+    """Fallback texte brut : cherche les blocs avec badge SM et âge 11."""
     lines = texte.split("\n")
 
     i = 0
     while i < len(lines):
         line = lines[i]
-        if re.search(r"Simple\s+Messieurs", line, re.IGNORECASE):
-            # Chercher la fin du bloc : prochaine ligne "Simple " ou fin
+        # Chercher le badge SM (mot isolé, pas SD)
+        if re.search(r"\bSM\b", line) and not re.search(r"\bSD\b", line):
+            # Trouver la fin du bloc : prochain badge SM ou SD
             bloc_fin = min(len(lines), i + 50)
             for j in range(i + 1, bloc_fin):
-                if re.search(r"Simple\s+(Messieurs|Dames|Gar|Filles)",
-                             lines[j], re.IGNORECASE):
+                if re.search(r"\b(?:SM|SD)\b", lines[j]):
                     bloc_fin = j
                     break
 
             bloc = "\n".join(lines[i:bloc_fin])
 
-            # Vérifier que CE bloc contient 11/12 ans
-            if re.search(r"[ÂA]ge\s*:?\s*11\s*[/\-]\s*12", bloc, re.IGNORECASE):
-                epreuve = {"nom_epreuve": line.strip()}
+            if _bloc_contient_age_11(bloc):
+                # Nom : première ligne significative (pas le badge, pas un champ)
+                nom = ""
+                for k in range(i, bloc_fin):
+                    l_s = lines[k].strip()
+                    if (l_s and l_s not in ("SM", "SD")
+                            and not re.match(
+                                r"^([ÂA]ge|Format|Classement|Tarif|Inscription)\s*:",
+                                l_s, re.IGNORECASE)):
+                        nom = l_s
+                        break
+
+                epreuve = {"nom_epreuve": nom}
 
                 match = re.search(
                     r"Tarif\s+jeune\s*:?\s*([\d,]+\s*€)", bloc, re.IGNORECASE
@@ -466,22 +505,35 @@ def _extraire_epreuves_depuis_texte(texte):
                 match = re.search(
                     r"Classement\s*:?\s*(.+?)(?:\n|$)", bloc, re.IGNORECASE
                 )
-                if match:
+                if match and match.group(1).strip():
                     epreuve["classement"] = match.group(1).strip()
 
                 match = re.search(
-                    r"Format\s*:?\s*(.+?)(?:\n|$)", bloc, re.IGNORECASE
+                    r"Format\s*:\s*(.+?)(?:\n|$)", bloc, re.IGNORECASE
                 )
-                if match:
+                if match and match.group(1).strip():
                     epreuve["format"] = match.group(1).strip()
+                else:
+                    match = re.search(
+                        r"Format\s*:?\s*\n+\s*(.+?)(?:\n|$)", bloc,
+                        re.IGNORECASE,
+                    )
+                    if match and match.group(1).strip():
+                        epreuve["format"] = match.group(1).strip()
 
                 match = re.search(
                     r"[ÂA]ge\s*:?\s*(.+?)(?:\n|$)", bloc, re.IGNORECASE
                 )
-                if match:
+                if match and match.group(1).strip():
                     epreuve["age"] = match.group(1).strip()
+                if "age" not in epreuve:
+                    match = re.search(
+                        r"(11\s*[/\-]\s*12\s*ans)", bloc, re.IGNORECASE
+                    )
+                    if match:
+                        epreuve["age"] = match.group(1).strip()
 
-                return [epreuve]  # 1 seul résultat
+                return [epreuve]
         i += 1
 
     return []
@@ -643,13 +695,14 @@ def _mode_test(args):
     # Diagnostic : chercher les mots-clés attendus
     print("\n--- DIAGNOSTIC DU CONTENU ---")
     mots_cles = [
+        "SM",
+        "SD",
         "Simple Messieurs",
-        "Simple Garçons",
-        "(TS)",
+        "Simple Mixte",
+        "TMC",
         "11/12",
-        "11/12 ans",
+        "11 ans",
         "Âge",
-        "Age",
         "Tarif jeune",
         "Classement",
         "Format",
@@ -660,14 +713,14 @@ def _mode_test(args):
         print(f"  '{mot}' : {status}")
 
     # Montrer les lignes contenant "Simple" ou "11/12"
-    print("\n--- LIGNES CONTENANT 'Simple' ou '11/12' ---")
+    print("\n--- LIGNES CONTENANT 'SM', 'SD', '11' ou 'Âge' ---")
     lines = texte.split("\n")
     shown = 0
     for i, line in enumerate(lines):
         line_stripped = line.strip()
         if not line_stripped:
             continue
-        if re.search(r"simple|11.?12|[âa]ge\s*:", line, re.IGNORECASE):
+        if re.search(r"\bSM\b|\bSD\b|simple|TMC|11.?12|\b11\s*ans|[âa]ge\s*:", line, re.IGNORECASE):
             print(f"  L{i}: {line_stripped[:120]}")
             shown += 1
             if shown >= 30:
