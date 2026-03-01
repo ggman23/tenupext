@@ -140,14 +140,66 @@ def _fetch_html_playwright(url, page, timeout=15000):
     except Exception:
         pass
     # Vérifier si le contenu est apparu (texte typique d'une page tournoi)
-    try:
-        page.wait_for_selector(
-            "text=Simple Messieurs", timeout=5000,
-        )
-    except Exception:
-        # Dernier recours : attendre un délai fixe
+    # Cherche n'importe quel texte lié aux épreuves (pas juste "Simple Messieurs")
+    selectors_to_try = [
+        "text=/11.?12/i",           # "11/12" dans n'importe quel format
+        "text=/Simple/i",            # "Simple Messieurs" ou "Simple Garçons"
+        "text=/preuve/i",            # "Épreuve" ou "épreuve"
+        "text=/tableau/i",           # "Tableau"
+    ]
+    content_found = False
+    for selector in selectors_to_try:
+        try:
+            page.wait_for_selector(selector, timeout=3000)
+            content_found = True
+            break
+        except Exception:
+            continue
+    if not content_found:
         page.wait_for_timeout(3000)
+
+    # Cliquer sur les onglets/tabs pour charger toutes les épreuves
+    _cliquer_onglets_epreuves(page)
+
     return page.content()
+
+
+def _cliquer_onglets_epreuves(page):
+    """Clique sur les onglets/tabs pour charger les sections des épreuves."""
+    # Chercher les onglets qui pourraient contenir "11/12", "épreuves", etc.
+    tab_selectors = [
+        # Onglets génériques
+        "button:has-text('preuve')",
+        "a:has-text('preuve')",
+        "[role='tab']:has-text('preuve')",
+        # Onglets liés à l'âge / catégorie
+        "button:has-text('11/12')",
+        "a:has-text('11/12')",
+        "[role='tab']:has-text('11/12')",
+        # Onglets "Tableau"
+        "button:has-text('Tableau')",
+        "a:has-text('Tableau')",
+        "[role='tab']:has-text('Tableau')",
+        # "Voir plus" ou "Afficher tout"
+        "button:has-text('Voir')",
+        "a:has-text('Voir plus')",
+        "button:has-text('Afficher')",
+        # Accordéons / expand
+        "[aria-expanded='false']",
+        ".accordion-header",
+        ".expand",
+    ]
+    for selector in tab_selectors:
+        try:
+            elements = page.query_selector_all(selector)
+            for el in elements:
+                try:
+                    el.click()
+                    page.wait_for_timeout(500)
+                except Exception:
+                    continue
+        except Exception:
+            continue
 
 
 # ---------------------------------------------------------------------------
@@ -284,31 +336,80 @@ def _fallback_texte(info, texte):
 # ---------------------------------------------------------------------------
 
 def _extraire_epreuves(soup, texte_complet):
-    """Extrait les épreuves Simple Messieurs (TS) avec Âge 11/12 ans ou 11 ans."""
+    """Extrait les épreuves avec catégorie d'âge 11/12 ans ou 11 ans.
+
+    Cherche toutes les épreuves (Simple Messieurs, Simple Garçons, etc.)
+    qui correspondent à la tranche d'âge 11/12 ans.
+    """
     epreuves = []
 
-    # Cherche dans le DOM les sections "Simple Messieurs"
-    epreuve_sections = soup.find_all(
-        string=re.compile(r"Simple\s+Messieurs", re.IGNORECASE)
-    )
+    # Stratégie 1 : Chercher dans le DOM les sections contenant "11/12"
+    # ou "11 ans" en combinaison avec une épreuve de simple
+    age_patterns = [
+        r"11\s*/\s*12",               # 11/12
+        r"11.12\s*ans",               # 11-12 ans, 11/12 ans
+        r"[ÂA]ge\s*:\s*11",           # Âge : 11...
+    ]
+    epreuve_name_patterns = [
+        r"Simple\s+Messieurs",        # Adultes / Mixte
+        r"Simple\s+Gar[çc]ons",       # Garçons (jeunes)
+        r"Simple\s+Dames",            # Dames
+        r"Simple\s+Filles",           # Filles (jeunes)
+        r"Simple",                     # Générique
+    ]
 
-    for section_text in epreuve_sections:
-        parent = section_text.find_parent()
+    # Cherche les blocs HTML contenant "11/12" ou "11 ans"
+    age_elements = []
+    for pattern in age_patterns:
+        age_elements.extend(
+            soup.find_all(string=re.compile(pattern, re.IGNORECASE))
+        )
+
+    for age_text in age_elements:
+        parent = age_text.find_parent()
         bloc = parent
-        for _ in range(10):
+        for _ in range(15):
             if bloc is None or bloc.name in ("body", "html", "[document]"):
                 break
             bloc_text = bloc.get_text()
-            has_ts = re.search(r"\(TS\)", bloc_text)
-            has_age = re.search(
-                r"[ÂA]ge\s*:\s*(11/12\s*ans|11\s*ans)", bloc_text, re.IGNORECASE
+            # Vérifie si ce bloc contient une épreuve de simple
+            has_simple = any(
+                re.search(p, bloc_text, re.IGNORECASE)
+                for p in epreuve_name_patterns
             )
-            if has_ts and has_age:
+            has_age = re.search(
+                r"11\s*[/\-]\s*12|[ÂA]ge\s*:?\s*11\s*ans",
+                bloc_text, re.IGNORECASE,
+            )
+            if has_simple and has_age:
                 epreuve = _extraire_details_epreuve(bloc)
                 if epreuve and epreuve not in epreuves:
                     epreuves.append(epreuve)
                 break
             bloc = bloc.parent
+
+    # Stratégie 2 : Chercher les sections "Simple ..." et remonter
+    for pattern in epreuve_name_patterns[:4]:  # Pas le générique "Simple"
+        epreuve_sections = soup.find_all(
+            string=re.compile(pattern, re.IGNORECASE)
+        )
+        for section_text in epreuve_sections:
+            parent = section_text.find_parent()
+            bloc = parent
+            for _ in range(15):
+                if bloc is None or bloc.name in ("body", "html", "[document]"):
+                    break
+                bloc_text = bloc.get_text()
+                has_age = re.search(
+                    r"11\s*[/\-]\s*12|[ÂA]ge\s*:?\s*11\s*ans",
+                    bloc_text, re.IGNORECASE,
+                )
+                if has_age:
+                    epreuve = _extraire_details_epreuve(bloc)
+                    if epreuve and epreuve not in epreuves:
+                        epreuves.append(epreuve)
+                    break
+                bloc = bloc.parent
 
     # Fallback : analyse du texte brut
     if not epreuves:
@@ -332,6 +433,11 @@ def _extraire_details_epreuve(bloc):
         )
         if match:
             epreuve["tarif_jeune"] = match.group(1).strip()
+    # Fallback : tarif générique
+    if "tarif_jeune" not in epreuve:
+        match = re.search(r"Tarif\s*:?\s*([\d,]+\s*€)", texte, re.IGNORECASE)
+        if match:
+            epreuve["tarif_jeune"] = match.group(1).strip()
 
     # Classement
     match = re.search(r"Classement\s*:?\s*(.+?)(?:\n|$)", texte, re.IGNORECASE)
@@ -344,36 +450,65 @@ def _extraire_details_epreuve(bloc):
         epreuve["format"] = match.group(1).strip()
 
     # Âge
-    match = re.search(r"[ÂA]ge\s*:\s*(.+?)(?:\n|$)", texte, re.IGNORECASE)
+    match = re.search(r"[ÂA]ge\s*:?\s*(.+?)(?:\n|$)", texte, re.IGNORECASE)
     if match:
         epreuve["age"] = match.group(1).strip()
+    # Fallback : chercher "11/12 ans" directement
+    if "age" not in epreuve:
+        match = re.search(r"(11\s*[/\-]\s*12\s*ans)", texte, re.IGNORECASE)
+        if match:
+            epreuve["age"] = match.group(1).strip()
 
-    # Nom de l'épreuve
-    match = re.search(
-        r"(Simple\s+Messieurs\s*\(TS\).*?)(?:\n|$)", texte, re.IGNORECASE
-    )
-    if match:
-        epreuve["nom_epreuve"] = match.group(1).strip()
+    # Nom de l'épreuve - accepte tous les types
+    nom_patterns = [
+        r"(Simple\s+Messieurs\s*(?:\(TS\))?.*?)(?:\n|$)",
+        r"(Simple\s+Gar[çc]ons\s*(?:\(TS\))?.*?)(?:\n|$)",
+        r"(Simple\s+Dames\s*(?:\(TS\))?.*?)(?:\n|$)",
+        r"(Simple\s+Filles\s*(?:\(TS\))?.*?)(?:\n|$)",
+        r"(Simple\s+\S+\s*(?:\(TS\))?.*?)(?:\n|$)",
+        r"(Tableau\s+.*?11\s*[/\-]\s*12.*?)(?:\n|$)",
+    ]
+    for nom_pattern in nom_patterns:
+        match = re.search(nom_pattern, texte, re.IGNORECASE)
+        if match:
+            epreuve["nom_epreuve"] = match.group(1).strip()
+            break
 
     return epreuve if epreuve else None
 
 
 def _extraire_epreuves_depuis_texte(texte):
-    """Fallback : extraction depuis le texte brut de la page."""
+    """Fallback : extraction depuis le texte brut de la page.
+
+    Cherche toute épreuve de simple (Messieurs, Garçons, Dames, Filles)
+    avec catégorie d'âge 11/12 ans.
+    """
     epreuves = []
     lines = texte.split("\n")
+
+    # Patterns pour détecter une ligne d'épreuve
+    epreuve_line_patterns = [
+        r"Simple\s+Messieurs",
+        r"Simple\s+Gar[çc]ons",
+        r"Simple\s+Dames",
+        r"Simple\s+Filles",
+        r"Simple\s+\S+",
+        r"Tableau\s+.*11\s*[/\-]\s*12",
+    ]
+    combined_epreuve_pattern = "|".join(epreuve_line_patterns)
+
+    # Patterns pour détecter l'âge 11/12
+    age_pattern = r"11\s*[/\-]\s*12|[ÂA]ge\s*:?\s*11\s*ans"
 
     i = 0
     while i < len(lines):
         line = lines[i]
-        if re.search(r"Simple\s+Messieurs\s*\(TS\)", line, re.IGNORECASE):
+        if re.search(combined_epreuve_pattern, line, re.IGNORECASE):
             bloc_debut = max(0, i - 5)
             bloc_fin = min(len(lines), i + 30)
             bloc = "\n".join(lines[bloc_debut:bloc_fin])
 
-            if re.search(
-                r"[ÂA]ge\s*:\s*(11/12\s*ans|11\s*ans)", bloc, re.IGNORECASE
-            ):
+            if re.search(age_pattern, bloc, re.IGNORECASE):
                 epreuve = {}
                 match = re.search(
                     r"Tarif\s+jeune\s*:?\s*([\d,]+\s*€)", bloc, re.IGNORECASE
@@ -383,6 +518,12 @@ def _extraire_epreuves_depuis_texte(texte):
                 else:
                     match = re.search(
                         r"Tarif\s+jeune\s*:?\s*(.+?)(?:\n|$)", bloc, re.IGNORECASE
+                    )
+                    if match:
+                        epreuve["tarif_jeune"] = match.group(1).strip()
+                if "tarif_jeune" not in epreuve:
+                    match = re.search(
+                        r"Tarif\s*:?\s*([\d,]+\s*€)", bloc, re.IGNORECASE
                     )
                     if match:
                         epreuve["tarif_jeune"] = match.group(1).strip()
@@ -400,14 +541,66 @@ def _extraire_epreuves_depuis_texte(texte):
                     epreuve["format"] = match.group(1).strip()
 
                 match = re.search(
-                    r"[ÂA]ge\s*:\s*(.+?)(?:\n|$)", bloc, re.IGNORECASE
+                    r"[ÂA]ge\s*:?\s*(.+?)(?:\n|$)", bloc, re.IGNORECASE
                 )
                 if match:
                     epreuve["age"] = match.group(1).strip()
+                if "age" not in epreuve:
+                    match = re.search(
+                        r"(11\s*[/\-]\s*12\s*ans)", bloc, re.IGNORECASE
+                    )
+                    if match:
+                        epreuve["age"] = match.group(1).strip()
 
                 epreuve["nom_epreuve"] = line.strip()
                 if epreuve:
                     epreuves.append(epreuve)
+        # Aussi chercher directement les lignes contenant "11/12"
+        # même sans un mot-clé "Simple" explicite
+        elif re.search(r"11\s*[/\-]\s*12\s*ans", line, re.IGNORECASE):
+            bloc_debut = max(0, i - 10)
+            bloc_fin = min(len(lines), i + 20)
+            bloc = "\n".join(lines[bloc_debut:bloc_fin])
+            epreuve = {}
+            # Chercher le nom de l'épreuve dans le contexte
+            match = re.search(
+                r"(Simple\s+\S+.*?)(?:\n|$)", bloc, re.IGNORECASE
+            )
+            if match:
+                epreuve["nom_epreuve"] = match.group(1).strip()
+            else:
+                epreuve["nom_epreuve"] = line.strip()
+
+            match = re.search(
+                r"Tarif\s+jeune\s*:?\s*([\d,]+\s*€)", bloc, re.IGNORECASE
+            )
+            if match:
+                epreuve["tarif_jeune"] = match.group(1).strip()
+            else:
+                match = re.search(
+                    r"Tarif\s*:?\s*([\d,]+\s*€)", bloc, re.IGNORECASE
+                )
+                if match:
+                    epreuve["tarif_jeune"] = match.group(1).strip()
+
+            match = re.search(
+                r"Classement\s*:?\s*(.+?)(?:\n|$)", bloc, re.IGNORECASE
+            )
+            if match:
+                epreuve["classement"] = match.group(1).strip()
+
+            match = re.search(
+                r"[ÂA]ge\s*:?\s*(.+?)(?:\n|$)", bloc, re.IGNORECASE
+            )
+            if match:
+                epreuve["age"] = match.group(1).strip()
+            else:
+                epreuve["age"] = re.search(
+                    r"(11\s*[/\-]\s*12\s*ans)", line, re.IGNORECASE
+                ).group(1).strip()
+
+            if epreuve and epreuve not in epreuves:
+                epreuves.append(epreuve)
         i += 1
 
     return epreuves
@@ -546,6 +739,10 @@ def main():
         "--save", metavar="FICHIER_JSON", default="progres_tournois.json",
         help="Fichier de sauvegarde intermédiaire (défaut: progres_tournois.json)",
     )
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="Sauvegarder le HTML de chaque page dans le dossier debug_html/",
+    )
     args = parser.parse_args()
 
     # Vérifications des arguments
@@ -595,6 +792,11 @@ def main():
             "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.5",
         })
 
+    # Créer le dossier debug si nécessaire
+    if args.debug:
+        os.makedirs("debug_html", exist_ok=True)
+        print("Mode debug activé : HTML sauvegardé dans debug_html/")
+
     # Traiter les tournois restants
     print(f"\nExtraction des tournois (délai: {args.delay}s)...")
     try:
@@ -613,6 +815,12 @@ def main():
                     html = _fetch_html_selenium(url, driver)
                 else:
                     html = _fetch_html_requests(url, session)
+
+                # Sauvegarder le HTML en mode debug
+                if args.debug:
+                    debug_path = f"debug_html/tournoi_{code}.html"
+                    with open(debug_path, "w", encoding="utf-8") as f:
+                        f.write(html)
 
                 info = parser_page_tournoi(html, code)
             except Exception as e:
@@ -638,7 +846,7 @@ def main():
                     f"{nb_epreuves} épreuve(s) correspondante(s)"
                 )
             else:
-                print(f"OK - {info['nom']} - aucune épreuve 11/12 ans SM(TS)")
+                print(f"OK - {info['nom']} - aucune épreuve 11/12 ans trouvée")
 
             # Sauvegarde intermédiaire tous les 10 tournois
             if len(tournois) % 10 == 0:
