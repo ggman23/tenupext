@@ -1234,6 +1234,9 @@ def generer_excel(tournois, chemin_sortie, adresse_depart=None):
     tmc_fill = PatternFill(
         start_color="FFFF00", end_color="FFFF00", fill_type="solid"
     )
+    erreur_fill = PatternFill(
+        start_color="FFC7CE", end_color="FFC7CE", fill_type="solid"
+    )
 
     for col, header in enumerate(headers, 1):
         cell = ws.cell(row=1, column=col, value=header)
@@ -1257,9 +1260,9 @@ def generer_excel(tournois, chemin_sortie, adresse_depart=None):
 
         if not epreuves:
             _ecrire_ligne_tournoi(ws, row, i, tournoi, None, trajet, trajets)
-            ws.cell(row=row, column=13, value="Aucune épreuve correspondante")
-            if est_tmc:
-                _appliquer_surlignage(ws, row, len(headers), tmc_fill)
+            ws.cell(row=row, column=13, value="⚠ Épreuve 11/12 non détectée (à retenter)")
+            # Rouge clair pour signaler le problème de détection
+            _appliquer_surlignage(ws, row, len(headers), erreur_fill)
             row += 1
         else:
             for epreuve in epreuves:
