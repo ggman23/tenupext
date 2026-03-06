@@ -1391,6 +1391,9 @@ def _rapport_validation(tournois, fichier_retry="tournois_retry.json"):
 
         # Vérifier les champs tournoi
         for champ, label in champs_tournoi:
+            # Tolérer "Fin" vide si "Début" est renseigné (tournoi mono-journée)
+            if champ == "fin" and not t.get("fin") and t.get("debut"):
+                continue
             ok, raison = _est_valide_pour_validation(t.get(champ, ""))
             if not ok:
                 defauts.append((label, raison))
@@ -2017,6 +2020,29 @@ def main():
                 url_info = parser_page_tournoi(html, code)
                 # Fusionner PDF (infos générales) + URL (classement/format)
                 info = _fusionner_donnees(pdf_data.get(code, {}), url_info)
+
+                # Retry intelligent Playwright : si aucune épreuve trouvée
+                # mais le HTML semble contenir des données d'épreuves (ex: "Âge"),
+                # le navigateur est peut-être dégradé → redémarrer et retenter.
+                if (args.playwright
+                        and not info.get("epreuves")
+                        and re.search(r"[âa]ge\s*:", html, re.IGNORECASE)):
+                    print("retry...", end=" ", flush=True)
+                    try:
+                        browser.close()
+                        pw.stop()
+                    except Exception:
+                        pass
+                    pw, browser, pw_page = _creer_playwright()
+                    time.sleep(args.delay)
+                    html = _fetch_html_playwright(url, pw_page)
+                    if args.debug:
+                        debug_path = f"debug_html/tournoi_{code}_retry.html"
+                        with open(debug_path, "w", encoding="utf-8") as f:
+                            f.write(html)
+                    url_info = parser_page_tournoi(html, code)
+                    info = _fusionner_donnees(pdf_data.get(code, {}), url_info)
+
             except Exception as e:
                 # Utiliser les données PDF même si l'URL échoue
                 info = pdf_data.get(code, {}).copy()
