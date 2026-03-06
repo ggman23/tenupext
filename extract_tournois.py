@@ -27,7 +27,7 @@ import time
 
 from PyPDF2 import PdfReader
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
@@ -725,10 +725,25 @@ def _extraire_epreuves(soup, texte_complet):
     # Stratégie 1 DOM : Chercher le badge "SM" puis remonter au plus haut
     # ancêtre valide (nb_sm <= 1 et contient âge 11).
     # On prend le plus haut pour avoir la carte complète (avec Classement/Format).
-    sm_badges = soup.find_all(string=re.compile(r"^\s*SM\s*$"))
+    # Chercher "SM" isolé (badge peut contenir espaces Unicode)
+    sm_badges = soup.find_all(
+        string=re.compile(r"^[\s\u00a0\u202f]*SM[\s\u00a0\u202f]*$")
+    )
+    # Fallback : chercher les éléments courts contenant uniquement "SM"
+    if not sm_badges:
+        for el in soup.find_all(["span", "div", "strong", "b", "p", "a"]):
+            if el.get_text(strip=True) == "SM":
+                sm_badges.append(el)
 
-    for badge_text in sm_badges:
-        bloc = badge_text.find_parent()
+    for badge_or_text in sm_badges:
+        # NavigableString -> parent est le Tag contenant le texte
+        # Tag (fallback) -> on commence directement depuis ce Tag
+        if isinstance(badge_or_text, NavigableString):
+            bloc = badge_or_text.parent
+        else:
+            bloc = badge_or_text
+        if bloc is None:
+            continue
         best_bloc = None
         for _ in range(15):
             if bloc is None or bloc.name in ("body", "html", "[document]"):
@@ -773,7 +788,21 @@ def _extraire_epreuves(soup, texte_complet):
             if epreuve:
                 return [epreuve]
 
-    # Stratégie 3 : Fallback texte brut
+    # Stratégie 3 DOM : Chercher les cartes d'épreuves par classe CSS,
+    # puis filtrer sur âge 11 et type SM/Simple Messieurs.
+    for cls in (".epreuve-card", ".epreuve-detail",
+                "[class*='epreuve']", ".card"):
+        cards = soup.select(cls)
+        for card in cards:
+            card_text = card.get_text()
+            if not _bloc_contient_age_11(card_text):
+                continue
+            if re.search(r"\bSM\b|Simple\s+Messieurs", card_text, re.IGNORECASE):
+                epreuve = _extraire_details_epreuve(card)
+                if epreuve:
+                    return [epreuve]
+
+    # Stratégie 4 : Fallback texte brut
     epreuves = _extraire_epreuves_depuis_texte(texte_complet)
     if epreuves:
         return [epreuves[0]]
@@ -849,29 +878,37 @@ def _extraire_details_epreuve(bloc):
             epreuve["classement"] = candidat
             break
 
-    # Format - CSS selector direct + regex
-    # Stratégie 1 : CSS selector (classe tenup.fft.fr)
-    fmt_el = bloc.select_one(".epreuve-detail-format")
-    if fmt_el:
-        val = fmt_el.get_text(strip=True)
-        cleaned = re.sub(r"^Format\s*:?\s*", "", val, flags=re.IGNORECASE)
-        if cleaned:
-            epreuve["format"] = cleaned
-    # Stratégie 2 : regex sur le texte
+    # Format - CSS selector direct + regex + DOM traversal
+    # Stratégie 1 : CSS selector (classe tenup.fft.fr) - variantes
+    for cls in (".epreuve-detail-format", ".epreuve-format",
+                "[class*='format']"):
+        if "format" in epreuve:
+            break
+        fmt_el = bloc.select_one(cls)
+        if fmt_el:
+            val = fmt_el.get_text(strip=True)
+            cleaned = re.sub(r"^Format\s*:?\s*", "", val, flags=re.IGNORECASE)
+            if cleaned:
+                epreuve["format"] = cleaned
+    # Stratégie 2 : regex sur le texte (avec séparateur souple : / - / rien)
     if "format" not in epreuve:
-        match = re.search(r"Format\s*:\s*(.+?)(?:\n|$)", texte, re.IGNORECASE)
+        match = re.search(
+            r"Format\s*[:\-–]?\s*(.+?)(?:\n|$)", texte, re.IGNORECASE
+        )
         if match and match.group(1).strip():
             epreuve["format"] = match.group(1).strip()
     if "format" not in epreuve:
         # Label "Format" seul sur une ligne, valeur sur la ligne suivante
         match = re.search(
-            r"Format\s*:?\s*\n+\s*(.+?)(?:\n|$)", texte, re.IGNORECASE
+            r"Format\s*[:\-–]?\s*\n+\s*(.+?)(?:\n|$)", texte, re.IGNORECASE
         )
         if match and match.group(1).strip():
             epreuve["format"] = match.group(1).strip()
     if "format" not in epreuve:
-        # Élément DOM contenant exactement "Format", valeur en sibling
-        format_el = bloc.find(string=re.compile(r"^\s*Format\s*:?\s*$", re.IGNORECASE))
+        # Élément DOM contenant "Format" (avec ou sans :), valeur en sibling
+        format_el = bloc.find(
+            string=re.compile(r"^\s*Format\s*[:\-–]?\s*$", re.IGNORECASE)
+        )
         if format_el:
             parent = format_el.find_parent()
             if parent:
@@ -882,9 +919,27 @@ def _extraire_details_epreuve(bloc):
                         epreuve["format"] = val
                 if "format" not in epreuve:
                     parent_text = parent.get_text(strip=True)
-                    cleaned = re.sub(r"^Format\s*:?\s*", "", parent_text, flags=re.IGNORECASE)
+                    cleaned = re.sub(
+                        r"^Format\s*[:\-–]?\s*", "", parent_text,
+                        flags=re.IGNORECASE,
+                    )
                     if cleaned:
                         epreuve["format"] = cleaned
+    # Stratégie 5 : chercher des patterns typiques de format de match
+    if "format" not in epreuve:
+        match = re.search(
+            r"(\d\s*set(?:s)?\s*(?:de\s*\d+\s*jeux?|gagnant).*?)(?:\n|$)",
+            texte, re.IGNORECASE,
+        )
+        if match:
+            epreuve["format"] = match.group(1).strip()
+    if "format" not in epreuve:
+        match = re.search(
+            r"((?:super[- ]?)?tie[- ]?break.*?)(?:\n|$)",
+            texte, re.IGNORECASE,
+        )
+        if match:
+            epreuve["format"] = match.group(1).strip()
 
     # Âge
     match = re.search(r"[ÂA]ge\s*:?\s*(.+?)(?:\n|$)", texte, re.IGNORECASE)
@@ -977,16 +1032,30 @@ def _extraire_epreuves_depuis_texte(texte):
                         break
 
                 match = re.search(
-                    r"Format\s*:\s*(.+?)(?:\n|$)", bloc, re.IGNORECASE
+                    r"Format\s*[:\-–]?\s*(.+?)(?:\n|$)", bloc, re.IGNORECASE
                 )
                 if match and match.group(1).strip():
                     epreuve["format"] = match.group(1).strip()
                 else:
                     match = re.search(
-                        r"Format\s*:?\s*\n+\s*(.+?)(?:\n|$)", bloc,
+                        r"Format\s*[:\-–]?\s*\n+\s*(.+?)(?:\n|$)", bloc,
                         re.IGNORECASE,
                     )
                     if match and match.group(1).strip():
+                        epreuve["format"] = match.group(1).strip()
+                if "format" not in epreuve:
+                    match = re.search(
+                        r"(\d\s*set(?:s)?\s*(?:de\s*\d+\s*jeux?|gagnant).*?)(?:\n|$)",
+                        bloc, re.IGNORECASE,
+                    )
+                    if match:
+                        epreuve["format"] = match.group(1).strip()
+                if "format" not in epreuve:
+                    match = re.search(
+                        r"((?:super[- ]?)?tie[- ]?break.*?)(?:\n|$)",
+                        bloc, re.IGNORECASE,
+                    )
+                    if match:
                         epreuve["format"] = match.group(1).strip()
 
                 match = re.search(
@@ -1093,6 +1162,18 @@ def _ecrire_ligne_tournoi(ws, row, num, tournoi, epreuve):
 # ---------------------------------------------------------------------------
 
 HISTORIQUE_DIR = "historique"
+
+
+def _formater_duree(secondes):
+    """Formate une durée en secondes en chaîne lisible (ex: 1h02min37s)."""
+    secondes = int(secondes)
+    if secondes < 60:
+        return f"{secondes}s"
+    minutes, sec = divmod(secondes, 60)
+    if minutes < 60:
+        return f"{minutes}min{sec:02d}s"
+    heures, minutes = divmod(minutes, 60)
+    return f"{heures}h{minutes:02d}min{sec:02d}s"
 
 
 def _chemin_historique(tag):
@@ -1518,12 +1599,28 @@ def main():
         print("Mode debug activé : HTML sauvegardé dans debug_html/")
 
     # Traiter les tournois restants
+    t_debut = time.time()
+    nb_deja_traites = len(tournois)
     print(f"\nExtraction des tournois (délai: {args.delay}s)...")
     try:
         while codes:
             code = codes[0]
             i = len(tournois) + 1
-            print(f"  [{i:3d}/{total}] Tournoi {code}...", end=" ", flush=True)
+            # Calcul du temps écoulé et ETA
+            elapsed = time.time() - t_debut
+            nb_faits = len(tournois) - nb_deja_traites
+            if nb_faits > 0:
+                temps_par_tournoi = elapsed / nb_faits
+                restants = len(codes)
+                eta = temps_par_tournoi * restants
+                eta_str = f" | ETA: {_formater_duree(eta)}"
+            else:
+                eta_str = ""
+            print(
+                f"  [{i:3d}/{total}] ({_formater_duree(elapsed)}{eta_str}) "
+                f"Tournoi {code}...",
+                end=" ", flush=True,
+            )
 
             time.sleep(args.delay)
 
@@ -1578,7 +1675,8 @@ def main():
                 sauvegarder_progres(tournois, codes, args.save)
 
     except KeyboardInterrupt:
-        print(f"\n\nInterruption ! Sauvegarde en cours...")
+        duree_interr = time.time() - t_debut
+        print(f"\n\nInterruption après {_formater_duree(duree_interr)} ! Sauvegarde en cours...")
         sauvegarder_progres(tournois, codes, args.save)
         print(f"Progrès sauvegardé dans : {args.save}")
         print(f"Reprenez avec : python extract_tournois.py --resume {args.save}")
@@ -1607,6 +1705,7 @@ def main():
         print(f"\n  Historique mis à jour : {chemin_hist} ({codes_total} tournoi(s) au total)")
 
     # Résumé
+    duree_totale = time.time() - t_debut
     nb_avec_epreuves = sum(1 for t in tournois if t.get("epreuves"))
     nb_erreurs = sum(1 for t in tournois if t.get("erreur"))
     print(f"\nRésumé :")
@@ -1614,6 +1713,7 @@ def main():
     print(f"  Avec épreuve(s) correspondante(s) : {nb_avec_epreuves}")
     print(f"  Erreurs : {nb_erreurs}")
     print(f"  Fichier Excel : {args.output}")
+    print(f"  Script exécuté en {_formater_duree(duree_totale)}")
 
 
 if __name__ == "__main__":
