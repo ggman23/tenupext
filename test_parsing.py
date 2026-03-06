@@ -15,6 +15,7 @@ from extract_tournois import (
     _bloc_contient_age_11,
     _normaliser_espaces,
     _est_valeur_valide,
+    _est_classement_valide,
     _fusionner_donnees,
 )
 from bs4 import BeautifulSoup
@@ -239,6 +240,103 @@ Simple Dames 13/14 ans
         ep = epreuves[0]
         check("Fallback texte: tarif", "9,50" in ep.get("tarif_jeune", ""), f"got: {ep.get('tarif_jeune')!r}")
         check("Fallback texte: classement", "30/5" in ep.get("classement", ""), f"got: {ep.get('classement')!r}")
+
+    # ──────────────────────────────────────────────────────────────
+    print("\n=== TEST 11 : _est_classement_valide ===")
+    check("NC - N1 valide", _est_classement_valide("NC - N1"))
+    check("NC - 30/5 valide", _est_classement_valide("NC - 30/5"))
+    check("40 - 30/1 valide", _est_classement_valide("40 - 30/1"))
+    check("30/5 - 30/1 valide", _est_classement_valide("30/5 - 30/1"))
+    check("NC valide", _est_classement_valide("NC"))
+    check("NC à 30/5 valide", _est_classement_valide("NC à 30/5"))
+    check("Texte parasite rejeté", not _est_classement_valide(
+        ", proximité et date d'inscription seront les critères pris en compte)"
+    ))
+    check("Phrase longue rejetée", not _est_classement_valide(
+        "demandé (classement, proximité et date d'inscription seront les critères)"
+    ))
+    check("Vide rejeté", not _est_classement_valide(""))
+    check("None rejeté", not _est_classement_valide(None))
+
+    # ──────────────────────────────────────────────────────────────
+    print("\n=== TEST 12 : Classement parasite (bug 196945) ===")
+    # Simule une page où le texte contient "Classement demandé (...)" en plus
+    # du vrai classement NC - 30/2
+    HTML_CLASSEMENT_PARASITE = """
+    <html><body>
+    <div class="epreuve-card">
+        <div class="badge">SM</div>
+        <div>Simple Messieurs 11/12 ans</div>
+        <div>Âge : 11/12 ans</div>
+        <div>Tarif jeune : 35,00 €</div>
+        <div>Classement demandé (classement, proximité et date d'inscription seront les critères pris en compte)</div>
+        <div>Classement</div>
+        <div>30/5 - 30/1</div>
+        <div>Format : 2 sets à 6 jeux</div>
+    </div>
+    </body></html>
+    """
+    info_parasite = parser_page_tournoi(HTML_CLASSEMENT_PARASITE, "196945")
+    check("Épreuve trouvée", len(info_parasite["epreuves"]) >= 1,
+          f"got: {len(info_parasite['epreuves'])}")
+    if info_parasite["epreuves"]:
+        ep = info_parasite["epreuves"][0]
+        classement = ep.get("classement", "")
+        check("Classement valide (pas de texte parasite)",
+              "proximité" not in classement,
+              f"got: {classement!r}")
+        check("Classement correct 30/5 - 30/1",
+              "30/5" in classement or "30/1" in classement or classement == "",
+              f"got: {classement!r}")
+
+    # ──────────────────────────────────────────────────────────────
+    print("\n=== TEST 13 : 'Retour aux résultats' filtré du nom d'épreuve ===")
+    HTML_RETOUR_RESULTATS = """
+    <html><body>
+    <div class="epreuve-card">
+        <a href="/tournois">Retour aux résultats</a>
+        <div class="badge">SM</div>
+        <div>Simple Messieurs 11/12 ans</div>
+        <div>Âge : 11/12 ans</div>
+        <div>Tarif jeune : 15,00 €</div>
+        <div>Classement : NC - N1</div>
+        <div>Format : 2 sets à 6 jeux</div>
+    </div>
+    </body></html>
+    """
+    info_retour = parser_page_tournoi(HTML_RETOUR_RESULTATS, "111111")
+    check("Épreuve trouvée", len(info_retour["epreuves"]) >= 1)
+    if info_retour["epreuves"]:
+        ep = info_retour["epreuves"][0]
+        nom = ep.get("nom_epreuve", "")
+        check("Nom != 'Retour aux résultats'",
+              "retour" not in nom.lower(),
+              f"got: {nom!r}")
+        check("Nom contient 'Simple Messieurs'",
+              "Simple Messieurs" in nom,
+              f"got: {nom!r}")
+
+    # ──────────────────────────────────────────────────────────────
+    print("\n=== TEST 14 : Fallback texte avec classement parasite ===")
+    texte_parasite = """
+SM
+Simple Messieurs 11/12 ans
+Âge : 11/12 ans
+Tarif jeune : 35,00 €
+Classement demandé (classement, proximité et date d'inscription)
+Classement : 30/5 - 30/1
+Format : 2 sets
+
+SD
+"""
+    epreuves_p = _extraire_epreuves_depuis_texte(texte_parasite)
+    check("Fallback: trouvé", len(epreuves_p) >= 1)
+    if epreuves_p:
+        ep = epreuves_p[0]
+        cls = ep.get("classement", "")
+        check("Fallback: pas de texte parasite",
+              "proximité" not in cls,
+              f"got: {cls!r}")
 
     # ──────────────────────────────────────────────────────────────
     print(f"\n{'='*50}")

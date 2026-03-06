@@ -362,11 +362,22 @@ def _fetch_html_playwright(url, page, timeout=15000):
         except Exception:
             continue
     if not content_found:
+        # Scroller vers le bas pour déclencher le lazy loading
+        try:
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(2000)
+            page.evaluate("window.scrollTo(0, 0)")
+            page.wait_for_timeout(1000)
+        except Exception:
+            pass
         # Dernier recours : attendre 5 secondes supplémentaires
         page.wait_for_timeout(5000)
 
     # Cliquer sur d'éventuels onglets/accordéons pour révéler du contenu caché
     _cliquer_onglets_epreuves(page)
+
+    # Attendre un peu après les clics pour que le contenu se charge
+    page.wait_for_timeout(1000)
 
     return page.content()
 
@@ -380,6 +391,13 @@ def _cliquer_onglets_epreuves(page):
         "button:has-text('Voir')",
         "a:has-text('Voir plus')",
         "button:has-text('Afficher')",
+        # Sélecteurs spécifiques tenup.fft.fr
+        ".tab-link",
+        ".nav-link:not(.active)",
+        "[role='tab'][aria-selected='false']",
+        "button:has-text('SM')",
+        "button:has-text('Simple')",
+        "a:has-text('Simple Messieurs')",
     ]
     for selector in tab_selectors:
         try:
@@ -422,6 +440,40 @@ def _est_valeur_valide(texte):
     ):
         return False
     return True
+
+
+def _est_classement_valide(texte):
+    """Vérifie que le texte ressemble à un classement FFT.
+
+    Exemples valides : "NC - N1", "NC - 30/5", "40 - 30/1", "30/5 - 30/1",
+    "NC", "N1", "30/5", "NC à 30/5", "Classé(e) ou NC".
+    Rejette les phrases descriptives comme "proximité et date d'inscription...".
+    """
+    if not texte:
+        return False
+    texte = texte.strip()
+    # Trop long pour être un classement (> 40 chars)
+    if len(texte) > 40:
+        return False
+    # Doit contenir au moins un élément typique d'un classement FFT
+    return bool(re.search(
+        r"\bNC\b|\bN[1-4]\b|\b[1-4]0\b|\b[23]0/[1-5]\b|\b15/[1-5]\b",
+        texte,
+    ))
+
+
+# Textes de navigation / bruit à exclure du nom d'épreuve
+_TEXTES_NAVIGATION = {
+    "retour aux résultats",
+    "retour",
+    "voir plus",
+    "voir les épreuves",
+    "afficher",
+    "aucune épreuve correspondante",
+    "aucune épreuve",
+    "chargement",
+    "loading",
+}
 
 
 def parser_page_tournoi(html, code):
@@ -745,38 +797,42 @@ def _extraire_details_epreuve(bloc):
             epreuve["tarif_jeune"] = match.group(1).strip()
 
     # Classement - essayer plusieurs patterns car label et valeur peuvent être
-    # sur des lignes séparées dans le DOM
+    # sur des lignes séparées dans le DOM.
+    # On valide ensuite que ça ressemble à un vrai classement FFT.
+    _classement_candidats = []
     match = re.search(r"Classement\s*:?\s*(.+?)(?:\n|$)", texte, re.IGNORECASE)
     if match and match.group(1).strip():
-        epreuve["classement"] = match.group(1).strip()
-    if "classement" not in epreuve:
-        # Label "Classement" seul sur une ligne, valeur sur la ligne suivante
-        match = re.search(
-            r"Classement\s*:?\s*\n+\s*(.+?)(?:\n|$)", texte, re.IGNORECASE
-        )
-        if match and match.group(1).strip():
-            epreuve["classement"] = match.group(1).strip()
-    if "classement" not in epreuve:
-        # Chercher directement dans les éléments DOM enfants
-        classement_el = bloc.find(
-            string=re.compile(r"^\s*Classement\s*:?\s*$", re.IGNORECASE)
-        )
-        if classement_el:
-            parent = classement_el.find_parent()
-            if parent:
-                sibling = parent.find_next_sibling()
-                if sibling:
-                    val = sibling.get_text(strip=True)
-                    if val:
-                        epreuve["classement"] = val
-                if "classement" not in epreuve:
-                    parent_text = parent.get_text(strip=True)
-                    cleaned = re.sub(
-                        r"^Classement\s*:?\s*", "", parent_text,
-                        flags=re.IGNORECASE,
-                    )
-                    if cleaned:
-                        epreuve["classement"] = cleaned
+        _classement_candidats.append(match.group(1).strip())
+    # Label "Classement" seul sur une ligne, valeur sur la ligne suivante
+    match = re.search(
+        r"Classement\s*:?\s*\n+\s*(.+?)(?:\n|$)", texte, re.IGNORECASE
+    )
+    if match and match.group(1).strip():
+        _classement_candidats.append(match.group(1).strip())
+    # Chercher directement dans les éléments DOM enfants
+    classement_el = bloc.find(
+        string=re.compile(r"^\s*Classement\s*:?\s*$", re.IGNORECASE)
+    )
+    if classement_el:
+        parent = classement_el.find_parent()
+        if parent:
+            sibling = parent.find_next_sibling()
+            if sibling:
+                val = sibling.get_text(strip=True)
+                if val:
+                    _classement_candidats.append(val)
+            parent_text = parent.get_text(strip=True)
+            cleaned = re.sub(
+                r"^Classement\s*:?\s*", "", parent_text,
+                flags=re.IGNORECASE,
+            )
+            if cleaned:
+                _classement_candidats.append(cleaned)
+    # Prendre le premier candidat qui ressemble à un vrai classement
+    for candidat in _classement_candidats:
+        if _est_classement_valide(candidat):
+            epreuve["classement"] = candidat
+            break
 
     # Format - essayer plusieurs patterns car label et valeur peuvent être
     # sur des lignes séparées dans le DOM
@@ -823,11 +879,13 @@ def _extraire_details_epreuve(bloc):
             if match:
                 epreuve["age"] = match.group(1).strip()
 
-    # Nom de l'épreuve : première ligne significative (pas le badge, pas un champ)
+    # Nom de l'épreuve : première ligne significative (pas le badge, pas un champ,
+    # pas un texte de navigation)
     for line in texte.split("\n"):
         line_s = line.strip()
         if (line_s
                 and line_s not in ("SM", "SD")
+                and line_s.lower() not in _TEXTES_NAVIGATION
                 and not re.match(
                     r"^([ÂA]ge|Format|Classement|Tarif|Inscription)\s*:",
                     line_s, re.IGNORECASE)):
@@ -856,11 +914,13 @@ def _extraire_epreuves_depuis_texte(texte):
             bloc = "\n".join(lines[i:bloc_fin])
 
             if _bloc_contient_age_11(bloc):
-                # Nom : première ligne significative (pas le badge, pas un champ)
+                # Nom : première ligne significative (pas le badge, pas un champ,
+                # pas un texte de navigation)
                 nom = ""
                 for k in range(i, bloc_fin):
                     l_s = lines[k].strip()
                     if (l_s and l_s not in ("SM", "SD")
+                            and l_s.lower() not in _TEXTES_NAVIGATION
                             and not re.match(
                                 r"^([ÂA]ge|Format|Classement|Tarif|Inscription)\s*:",
                                 l_s, re.IGNORECASE)):
@@ -875,18 +935,23 @@ def _extraire_epreuves_depuis_texte(texte):
                 if match:
                     epreuve["tarif_jeune"] = match.group(1).strip()
 
+                # Classement : valider que c'est un vrai classement FFT
+                _cls_candidats = []
                 match = re.search(
                     r"Classement\s*:?\s*(.+?)(?:\n|$)", bloc, re.IGNORECASE
                 )
                 if match and match.group(1).strip():
-                    epreuve["classement"] = match.group(1).strip()
-                if "classement" not in epreuve:
-                    match = re.search(
-                        r"Classement\s*:?\s*\n+\s*(.+?)(?:\n|$)", bloc,
-                        re.IGNORECASE,
-                    )
-                    if match and match.group(1).strip():
-                        epreuve["classement"] = match.group(1).strip()
+                    _cls_candidats.append(match.group(1).strip())
+                match = re.search(
+                    r"Classement\s*:?\s*\n+\s*(.+?)(?:\n|$)", bloc,
+                    re.IGNORECASE,
+                )
+                if match and match.group(1).strip():
+                    _cls_candidats.append(match.group(1).strip())
+                for candidat in _cls_candidats:
+                    if _est_classement_valide(candidat):
+                        epreuve["classement"] = candidat
+                        break
 
                 match = re.search(
                     r"Format\s*:\s*(.+?)(?:\n|$)", bloc, re.IGNORECASE
