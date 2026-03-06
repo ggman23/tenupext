@@ -1350,14 +1350,18 @@ def _rapport_validation(tournois, fichier_retry="tournois_retry.json"):
 
     Vérifie les champs obligatoires (url, club, debut, fin, surface,
     tarif, classement, format) et détecte les valeurs incohérentes.
+    Inclut aussi les tournois sans épreuve détectée et ceux en erreur.
     Les codes des tournois problématiques sont sauvegardés dans un fichier
     JSON utilisable avec --retry.
     """
 
-    # Ne valider que les tournois qui ont des épreuves 11/12 ans
     tournois_avec_epreuves = [t for t in tournois if t.get("epreuves")]
+    tournois_sans_epreuve = [
+        t for t in tournois
+        if not t.get("epreuves") and not t.get("erreur")
+    ]
 
-    if not tournois_avec_epreuves:
+    if not tournois:
         return
 
     # Champs critiques au niveau tournoi
@@ -1414,6 +1418,7 @@ def _rapport_validation(tournois, fichier_retry="tournois_retry.json"):
     # Collecter tous les codes à retenter
     codes_retry = list(dict.fromkeys(
         [code for code, _, _ in problemes]
+        + [t.get("code", "") for t in tournois_sans_epreuve if t.get("code")]
         + [t.get("code", "") for t in erreurs if t.get("code")]
     ))
 
@@ -1422,10 +1427,24 @@ def _rapport_validation(tournois, fichier_retry="tournois_retry.json"):
     print(f"  RAPPORT DE VALIDATION")
     print(f"{'='*70}")
     print(f"  Tournois avec épreuve(s) 11/12 ans : {len(tournois_avec_epreuves)}")
+    print(f"  Tournois sans épreuve détectée      : {len(tournois_sans_epreuve)}")
 
-    if not problemes and not erreurs:
+    if not problemes and not erreurs and not tournois_sans_epreuve:
         print(f"  ✓ Tous les champs importants sont renseignés !")
     else:
+        # Tournois sans épreuve détectée
+        if tournois_sans_epreuve:
+            print(f"\n  ⚠ {len(tournois_sans_epreuve)} tournoi(s) sans épreuve 11/12 détectée :")
+            for t in tournois_sans_epreuve:
+                code = t.get("code", "?")
+                nom = t.get("nom", "(sans nom)")
+                url = t.get("url", "")
+                print(f"  [{code}] {nom}")
+                if url:
+                    print(f"           → {url}")
+            print()
+
+        # Tournois avec champs manquants/incohérents
         if problemes:
             print(f"  ⚠ {len(problemes)} tournoi(s) avec champ(s) manquant(s)/incohérent(s) :\n")
             for code, nom, defauts in problemes:
@@ -1458,7 +1477,7 @@ def _rapport_validation(tournois, fichier_retry="tournois_retry.json"):
             json.dump({"codes_retry": codes_retry}, f, ensure_ascii=False, indent=2)
         print(f"\n  → {len(codes_retry)} tournoi(s) à retenter")
         print(f"  → Fichier sauvegardé : {fichier_retry}")
-        print(f"  → Relancez avec : python extract_tournois.py <pdf> --retry {fichier_retry} --playwright")
+        print(f"  → Relancez avec : python extract_tournois.py --retry {fichier_retry} --playwright")
     else:
         # Supprimer un ancien fichier retry s'il existe
         if os.path.exists(fichier_retry):
