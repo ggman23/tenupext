@@ -7,6 +7,7 @@ Usage:
     python extract_tournois.py <fichier_pdf> --playwright  # RECOMMANDÉ (le site nécessite JS)
     python extract_tournois.py <fichier_pdf> --selenium    # alternative avec Selenium
     python extract_tournois.py --resume sauvegarde.json    # reprendre une extraction interrompue
+    python extract_tournois.py --retry tournois_retry.json --playwright  # retenter les tournois problématiques
 
     # Mode mise à jour : n'extraire que les nouveaux tournois
     python extract_tournois.py <fichier_pdf> --playwright --tag idf-oct-dec-2026 --mode maj
@@ -1077,11 +1078,142 @@ def _extraire_epreuves_depuis_texte(texte):
 
 
 # ---------------------------------------------------------------------------
+# 4b. Calcul des trajets (distance / durée) via OSRM
+# ---------------------------------------------------------------------------
+
+def _geocoder_adresse(adresse, session=None):
+    """Géocode une adresse en coordonnées (lat, lon) via Nominatim (OSM)."""
+    if not adresse:
+        return None
+    url = "https://nominatim.openstreetmap.org/search"
+    params = {"q": adresse, "format": "json", "limit": 1, "countrycodes": "fr"}
+    headers = {"User-Agent": "tenupext-tournois/1.0"}
+    try:
+        sess = session or requests
+        resp = sess.get(url, params=params, headers=headers, timeout=10)
+        data = resp.json()
+        if data:
+            return float(data[0]["lat"]), float(data[0]["lon"])
+    except Exception:
+        pass
+    return None
+
+
+def _calculer_trajet_osrm(coord_depart, coord_arrivee):
+    """Calcule distance (km) et durée (min) via OSRM (route en voiture).
+
+    Retourne (distance_km, duree_minutes) ou (None, None) en cas d'erreur.
+    OSRM est gratuit et ne nécessite pas de clé API.
+    """
+    if not coord_depart or not coord_arrivee:
+        return None, None
+    # OSRM utilise lon,lat (pas lat,lon)
+    orig = f"{coord_depart[1]},{coord_depart[0]}"
+    dest = f"{coord_arrivee[1]},{coord_arrivee[0]}"
+    url = f"https://router.project-osrm.org/route/v1/driving/{orig};{dest}"
+    params = {"overview": "false"}
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        data = resp.json()
+        if data.get("code") == "Ok" and data.get("routes"):
+            route = data["routes"][0]
+            distance_km = round(route["distance"] / 1000, 1)
+            duree_min = round(route["duration"] / 60)
+            return distance_km, duree_min
+    except Exception:
+        pass
+    return None, None
+
+
+def _calculer_trajets_tournois(tournois, adresse_depart):
+    """Calcule les trajets pour tous les tournois depuis une adresse de départ.
+
+    Retourne un dict {code: (distance_km, duree_texte)}.
+    """
+    sess = requests.Session()
+    sess.headers.update({"User-Agent": "tenupext-tournois/1.0"})
+
+    print(f"\nGéocodage de l'adresse de départ...")
+    coord_depart = _geocoder_adresse(adresse_depart, sess)
+    if not coord_depart:
+        print(f"  ⚠ Impossible de géocoder l'adresse de départ : {adresse_depart}")
+        return {}
+
+    print(f"  → Coordonnées : {coord_depart[0]:.5f}, {coord_depart[1]:.5f}")
+
+    # Récupérer les adresses uniques des tournois
+    adresses_uniques = {}
+    for t in tournois:
+        lieu = t.get("lieu", "")
+        code = t.get("code", "")
+        if lieu and code and lieu not in adresses_uniques:
+            adresses_uniques[lieu] = None  # sera rempli avec les coordonnées
+
+    print(f"  Géocodage de {len(adresses_uniques)} adresse(s) de tournoi...")
+    nb_ok = 0
+    for i, lieu in enumerate(adresses_uniques):
+        coord = _geocoder_adresse(lieu, sess)
+        adresses_uniques[lieu] = coord
+        if coord:
+            nb_ok += 1
+        # Respecter la politique Nominatim : 1 requête/seconde max
+        if i < len(adresses_uniques) - 1:
+            time.sleep(1.1)
+
+    print(f"  → {nb_ok}/{len(adresses_uniques)} adresse(s) géocodée(s)")
+
+    # Calculer les trajets
+    print(f"  Calcul des trajets...")
+    resultats = {}
+    lieux_calcules = {}  # cache lieu -> (dist, duree)
+    for t in tournois:
+        code = t.get("code", "")
+        lieu = t.get("lieu", "")
+        if not lieu or not code:
+            continue
+
+        if lieu in lieux_calcules:
+            resultats[code] = lieux_calcules[lieu]
+            continue
+
+        coord_arrivee = adresses_uniques.get(lieu)
+        dist, duree_min = _calculer_trajet_osrm(coord_depart, coord_arrivee)
+        if dist is not None:
+            heures = duree_min // 60
+            minutes = duree_min % 60
+            if heures > 0:
+                duree_texte = f"{heures}h{minutes:02d}"
+            else:
+                duree_texte = f"{minutes} min"
+            result = (dist, duree_texte)
+        else:
+            result = (None, None)
+
+        lieux_calcules[lieu] = result
+        resultats[code] = result
+        # Petit délai pour ne pas surcharger OSRM
+        time.sleep(0.5)
+
+    nb_trajets = sum(1 for d, _ in resultats.values() if d is not None)
+    print(f"  → {nb_trajets} trajet(s) calculé(s)")
+    return resultats
+
+
+# ---------------------------------------------------------------------------
 # 5. Génération du fichier Excel
 # ---------------------------------------------------------------------------
 
-def generer_excel(tournois, chemin_sortie):
-    """Génère le fichier Excel final."""
+def generer_excel(tournois, chemin_sortie, adresse_depart=None):
+    """Génère le fichier Excel final.
+
+    Si adresse_depart est fourni, ajoute les colonnes Distance et Durée.
+    Les lignes contenant "TMC" sont surlignées en jaune.
+    """
+    # Calculer les trajets si demandé
+    trajets = {}
+    if adresse_depart:
+        trajets = _calculer_trajets_tournois(tournois, adresse_depart)
+
     wb = Workbook()
     ws = wb.active
     ws.title = "Tournois"
@@ -1092,10 +1224,15 @@ def generer_excel(tournois, chemin_sortie):
         "Mail", "Tél", "Épreuve", "Âge", "Tarif jeune",
         "Classement", "Format", "Erreur",
     ]
+    if trajets:
+        headers.extend(["Distance (km)", "Durée trajet"])
 
     header_font = Font(bold=True, color="FFFFFF")
     header_fill = PatternFill(
         start_color="2E75B6", end_color="2E75B6", fill_type="solid"
+    )
+    tmc_fill = PatternFill(
+        start_color="FFFF00", end_color="FFFF00", fill_type="solid"
     )
 
     for col, header in enumerate(headers, 1):
@@ -1107,13 +1244,28 @@ def generer_excel(tournois, chemin_sortie):
     row = 2
     for i, tournoi in enumerate(tournois, 1):
         epreuves = tournoi.get("epreuves", [])
+        code = tournoi.get("code", "")
+        trajet = trajets.get(code, (None, None))
+
+        # Déterminer si c'est un TMC (vérifier nom et épreuves)
+        est_tmc = "TMC" in (tournoi.get("nom", "") or "").upper()
+        if not est_tmc:
+            for ep in epreuves:
+                if "TMC" in (ep.get("nom_epreuve", "") or "").upper():
+                    est_tmc = True
+                    break
+
         if not epreuves:
-            _ecrire_ligne_tournoi(ws, row, i, tournoi, None)
+            _ecrire_ligne_tournoi(ws, row, i, tournoi, None, trajet, trajets)
             ws.cell(row=row, column=13, value="Aucune épreuve correspondante")
+            if est_tmc:
+                _appliquer_surlignage(ws, row, len(headers), tmc_fill)
             row += 1
         else:
             for epreuve in epreuves:
-                _ecrire_ligne_tournoi(ws, row, i, tournoi, epreuve)
+                _ecrire_ligne_tournoi(ws, row, i, tournoi, epreuve, trajet, trajets)
+                if est_tmc or "TMC" in (epreuve.get("nom_epreuve", "") or "").upper():
+                    _appliquer_surlignage(ws, row, len(headers), tmc_fill)
                 row += 1
 
     # Largeur des colonnes
@@ -1122,6 +1274,9 @@ def generer_excel(tournois, chemin_sortie):
         "H": 30, "I": 25, "J": 50, "K": 30, "L": 18, "M": 35,
         "N": 15, "O": 15, "P": 20, "Q": 45, "R": 30,
     }
+    if trajets:
+        largeurs["S"] = 15
+        largeurs["T"] = 15
     for col_letter, width in largeurs.items():
         ws.column_dimensions[col_letter].width = width
 
@@ -1130,7 +1285,13 @@ def generer_excel(tournois, chemin_sortie):
     return row - 2
 
 
-def _ecrire_ligne_tournoi(ws, row, num, tournoi, epreuve):
+def _appliquer_surlignage(ws, row, nb_cols, fill):
+    """Applique un surlignage à toutes les cellules d'une ligne."""
+    for col in range(1, nb_cols + 1):
+        ws.cell(row=row, column=col).fill = fill
+
+
+def _ecrire_ligne_tournoi(ws, row, num, tournoi, epreuve, trajet=None, trajets=None):
     """Écrit une ligne de données dans la feuille Excel."""
     ws.cell(row=row, column=1, value=num)
     ws.cell(row=row, column=2, value=tournoi.get("code", ""))
@@ -1151,62 +1312,110 @@ def _ecrire_ligne_tournoi(ws, row, num, tournoi, epreuve):
         ws.cell(row=row, column=16, value=epreuve.get("classement", ""))
         ws.cell(row=row, column=17, value=epreuve.get("format", ""))
     ws.cell(row=row, column=18, value=tournoi.get("erreur", ""))
+    # Colonnes trajet si disponibles
+    if trajets and trajet:
+        dist, duree = trajet
+        if dist is not None:
+            ws.cell(row=row, column=19, value=dist)
+            ws.cell(row=row, column=20, value=duree)
 
 
 # ---------------------------------------------------------------------------
 # 5b. Rapport de validation post-extraction
 # ---------------------------------------------------------------------------
 
-def _rapport_validation(tournois):
-    """Affiche un rapport de validation identifiant les tournois avec des champs manquants."""
+_VALEURS_INCOHERENTES = re.compile(
+    r"aucun\s*r[ée]sultat|non\s*renseign|non\s*disponible|n[\s/]*a\b|"
+    r"à\s*définir|à\s*confirmer|inconnu|^\s*-+\s*$|^\s*\.\s*$|"
+    r"proximité\s+et\s+date|classement\s+demand|"
+    r"googletag|adsbygoogle|__webpack|function\s*\(",
+    re.IGNORECASE,
+)
 
-    # Champs critiques au niveau tournoi
-    champs_tournoi = [
-        ("nom", "Nom"),
-        ("club", "Club"),
-        ("debut", "Début"),
-        ("fin", "Fin"),
-        ("surface", "Surface"),
-        ("lieu", "Lieu"),
-    ]
-    # Champs critiques au niveau épreuve
-    champs_epreuve = [
-        ("classement", "Classement"),
-        ("format", "Format"),
-        ("tarif_jeune", "Tarif jeune"),
-    ]
 
-    # Filtrer uniquement les tournois qui ont des épreuves 11/12 ans
+def _est_valide_pour_validation(valeur):
+    """Vérifie qu'une valeur n'est ni vide ni incohérente."""
+    if not valeur:
+        return False, "VIDE"
+    val = str(valeur).strip()
+    if not val:
+        return False, "VIDE"
+    if _VALEURS_INCOHERENTES.search(val):
+        return False, f"INCOHÉRENT ({val})"
+    return True, ""
+
+
+def _rapport_validation(tournois, fichier_retry="tournois_retry.json"):
+    """Affiche un rapport de validation et sauvegarde les codes problématiques.
+
+    Vérifie les champs obligatoires (url, club, debut, fin, surface,
+    tarif, classement, format) et détecte les valeurs incohérentes.
+    Les codes des tournois problématiques sont sauvegardés dans un fichier
+    JSON utilisable avec --retry.
+    """
+
+    # Ne valider que les tournois qui ont des épreuves 11/12 ans
     tournois_avec_epreuves = [t for t in tournois if t.get("epreuves")]
 
     if not tournois_avec_epreuves:
         return
 
-    problemes = []  # Liste de (code, nom, [champs_manquants])
+    # Champs critiques au niveau tournoi
+    champs_tournoi = [
+        ("url", "URL"),
+        ("club", "Club"),
+        ("debut", "Début"),
+        ("fin", "Fin"),
+        ("surface", "Surface"),
+    ]
+    # Champs critiques au niveau épreuve
+    champs_epreuve = [
+        ("tarif_jeune", "Tarif"),
+        ("classement", "Classement"),
+        ("format", "Format"),
+    ]
+
+    problemes = []  # Liste de (code, nom, [(label, raison)])
 
     for t in tournois_avec_epreuves:
         code = t.get("code", "?")
         nom = t.get("nom", "(sans nom)")
-        manquants = []
+        defauts = []
 
         # Vérifier les champs tournoi
         for champ, label in champs_tournoi:
-            val = t.get(champ, "")
-            if not val or not str(val).strip():
-                manquants.append(label)
+            ok, raison = _est_valide_pour_validation(t.get(champ, ""))
+            if not ok:
+                defauts.append((label, raison))
 
-        # Vérifier les champs épreuve
+        # Vérifier les champs épreuve (pour chaque épreuve 11/12)
         for ep in t.get("epreuves", []):
+            ep_nom = ep.get("nom_epreuve", "épreuve")
             for champ, label in champs_epreuve:
-                val = ep.get(champ, "")
-                if not val or not str(val).strip():
-                    ep_nom = ep.get("nom_epreuve", "épreuve")
+                ok, raison = _est_valide_pour_validation(ep.get(champ, ""))
+                if not ok:
                     tag = f"{label} ({ep_nom})"
-                    if tag not in manquants:
-                        manquants.append(tag)
+                    defauts.append((tag, raison))
 
-        if manquants:
-            problemes.append((code, nom, manquants))
+            # Vérification spécifique : classement doit ressembler à du FFT
+            classement = ep.get("classement", "")
+            if classement and not _est_classement_valide(classement):
+                defauts.append((
+                    f"Classement ({ep_nom})",
+                    f"INCOHÉRENT ({classement})",
+                ))
+
+        if defauts:
+            problemes.append((code, nom, defauts))
+
+    # Tournois en erreur (même sans épreuves)
+    erreurs = [t for t in tournois if t.get("erreur")]
+
+    # Collecter tous les codes à retenter
+    codes_retry = list(dict.fromkeys(
+        [code for code, _, _ in problemes]
+        + [t.get("code", "") for t in erreurs if t.get("code")]
+    ))
 
     # Affichage du rapport
     print(f"\n{'='*70}")
@@ -1214,35 +1423,46 @@ def _rapport_validation(tournois):
     print(f"{'='*70}")
     print(f"  Tournois avec épreuve(s) 11/12 ans : {len(tournois_avec_epreuves)}")
 
-    if not problemes:
+    if not problemes and not erreurs:
         print(f"  ✓ Tous les champs importants sont renseignés !")
     else:
-        print(f"  ⚠ {len(problemes)} tournoi(s) avec champ(s) manquant(s) :\n")
-        for code, nom, manquants in problemes:
-            print(f"  [{code}] {nom}")
-            for m in manquants:
-                print(f"           → {m} : VIDE")
-            print()
+        if problemes:
+            print(f"  ⚠ {len(problemes)} tournoi(s) avec champ(s) manquant(s)/incohérent(s) :\n")
+            for code, nom, defauts in problemes:
+                print(f"  [{code}] {nom}")
+                for label, raison in defauts:
+                    print(f"           → {label} : {raison}")
+                print()
 
-    # Résumé par type de champ manquant
-    if problemes:
-        compteur = {}
-        for _, _, manquants in problemes:
-            for m in manquants:
-                # Extraire le nom du champ (avant la parenthèse si épreuve)
-                champ_base = m.split(" (")[0]
-                compteur[champ_base] = compteur.get(champ_base, 0) + 1
+        # Synthèse par type de champ
+        if problemes:
+            compteur = {}
+            for _, _, defauts in problemes:
+                for label, _ in defauts:
+                    champ_base = label.split(" (")[0]
+                    compteur[champ_base] = compteur.get(champ_base, 0) + 1
 
-        print(f"  --- Synthèse des champs manquants ---")
-        for champ, nb in sorted(compteur.items(), key=lambda x: -x[1]):
-            print(f"    {champ:15s} : {nb} tournoi(s)")
+            print(f"  --- Synthèse des champs problématiques ---")
+            for champ, nb in sorted(compteur.items(), key=lambda x: -x[1]):
+                print(f"    {champ:15s} : {nb} tournoi(s)")
 
-    # Tournois en erreur
-    erreurs = [t for t in tournois if t.get("erreur")]
-    if erreurs:
-        print(f"\n  --- Tournois en erreur ({len(erreurs)}) ---")
-        for t in erreurs:
-            print(f"  [{t.get('code', '?')}] {t.get('erreur', '')}")
+        # Tournois en erreur
+        if erreurs:
+            print(f"\n  --- Tournois en erreur ({len(erreurs)}) ---")
+            for t in erreurs:
+                print(f"  [{t.get('code', '?')}] {t.get('erreur', '')}")
+
+    # Sauvegarder le fichier retry
+    if codes_retry:
+        with open(fichier_retry, "w", encoding="utf-8") as f:
+            json.dump({"codes_retry": codes_retry}, f, ensure_ascii=False, indent=2)
+        print(f"\n  → {len(codes_retry)} tournoi(s) à retenter")
+        print(f"  → Fichier sauvegardé : {fichier_retry}")
+        print(f"  → Relancez avec : python extract_tournois.py <pdf> --retry {fichier_retry} --playwright")
+    else:
+        # Supprimer un ancien fichier retry s'il existe
+        if os.path.exists(fichier_retry):
+            os.remove(fichier_retry)
 
     print(f"{'='*70}")
 
@@ -1558,6 +1778,13 @@ def main():
         "--list-tags", action="store_true",
         help="Lister tous les tags d'historique disponibles et quitter.",
     )
+    parser.add_argument(
+        "--retry", metavar="FICHIER_JSON",
+        help=(
+            "Relancer l'extraction uniquement sur les tournois problématiques "
+            "listés dans le fichier JSON généré par le rapport de validation."
+        ),
+    )
     args = parser.parse_args()
 
     # Mode liste des tags
@@ -1582,12 +1809,27 @@ def main():
         parser.error("Le mode 'maj' nécessite --tag pour identifier l'historique à comparer.")
 
     # Vérifications des arguments
-    if not args.pdf and not args.resume:
-        parser.error("Fournissez un fichier PDF ou utilisez --resume")
+    if not args.pdf and not args.resume and not args.retry:
+        parser.error("Fournissez un fichier PDF ou utilisez --resume / --retry")
 
     # Charger ou extraire les codes + infos PDF
     pdf_data = {}  # code -> info extraite du PDF
-    if args.resume and os.path.exists(args.resume):
+    if args.retry:
+        # Mode retry : relancer uniquement les tournois problématiques
+        if not os.path.exists(args.retry):
+            parser.error(f"Fichier retry introuvable : {args.retry}")
+        with open(args.retry, "r", encoding="utf-8") as f:
+            retry_data = json.load(f)
+        codes = retry_data.get("codes_retry", [])
+        print(f"Mode retry depuis : {args.retry}")
+        print(f"  -> {len(codes)} tournoi(s) à retenter")
+        tournois = []
+        # Charger les données PDF si fournies
+        if args.pdf:
+            pdf_tournois = extraire_tournois_du_pdf(args.pdf)
+            pdf_data = {t["code"]: t for t in pdf_tournois}
+            print(f"  -> {len(pdf_data)} fiche(s) PDF chargée(s)")
+    elif args.resume and os.path.exists(args.resume):
         print(f"Reprise depuis : {args.resume}")
         tournois, codes = charger_progres(args.resume)
         print(f"  -> {len(tournois)} tournoi(s) déjà traité(s)")
@@ -1692,6 +1934,23 @@ def main():
         os.makedirs("debug_html", exist_ok=True)
         print("Mode debug activé : HTML sauvegardé dans debug_html/")
 
+    # Demander si l'utilisateur veut calculer les trajets
+    adresse_depart = None
+    try:
+        reponse_trajet = input("\nTrajet (calcul distance/durée) ? [oui/non] : ").strip().lower()
+        if reponse_trajet in ("oui", "o", "yes", "y"):
+            adresse_depart = input("Adresse de départ : ").strip()
+            if adresse_depart:
+                print(f"  → Trajets calculés depuis : {adresse_depart}")
+                print(f"  → Heure de départ : 8h00 le jour du début du tournoi")
+            else:
+                print("  → Adresse vide, pas de calcul de trajet.")
+                adresse_depart = None
+        else:
+            print("  → Pas de calcul de trajet.")
+    except (EOFError, KeyboardInterrupt):
+        print("\n  → Pas de calcul de trajet.")
+
     # Traiter les tournois restants
     t_debut = time.time()
     nb_deja_traites = len(tournois)
@@ -1786,9 +2045,16 @@ def main():
     # Sauvegarde finale
     sauvegarder_progres(tournois, [], args.save)
 
+    # Déterminer le nom du fichier Excel
+    chemin_excel = args.output
+    if args.mode == "maj" and chemin_excel == "tournois_extraits.xlsx":
+        # En mode maj, utiliser un fichier différent pour ne pas écraser le complet
+        base, ext = os.path.splitext(chemin_excel)
+        chemin_excel = f"{base}_maj{ext}"
+
     # Générer le fichier Excel
-    print(f"\nGénération du fichier Excel : {args.output}")
-    nb_lignes = generer_excel(tournois, args.output)
+    print(f"\nGénération du fichier Excel : {chemin_excel}")
+    nb_lignes = generer_excel(tournois, chemin_excel, adresse_depart=adresse_depart)
     print(f"  -> {nb_lignes} ligne(s) écrite(s)")
 
     # Sauvegarder l'historique si un tag est fourni
@@ -1806,7 +2072,7 @@ def main():
     print(f"  Tournois traités : {len(tournois)}")
     print(f"  Avec épreuve(s) correspondante(s) : {nb_avec_epreuves}")
     print(f"  Erreurs : {nb_erreurs}")
-    print(f"  Fichier Excel : {args.output}")
+    print(f"  Fichier Excel : {chemin_excel}")
     print(f"  Script exécuté en {_formater_duree(duree_totale)}")
 
     # Rapport de validation
