@@ -8,6 +8,11 @@ Usage:
     python extract_tournois.py <fichier_pdf> --selenium    # alternative avec Selenium
     python extract_tournois.py --resume sauvegarde.json    # reprendre une extraction interrompue
 
+    # Mode mise à jour : n'extraire que les nouveaux tournois
+    python extract_tournois.py <fichier_pdf> --playwright --tag idf-oct-dec-2026 --mode maj
+    # Mode complet (défaut) : tout extraire, met à jour l'historique
+    python extract_tournois.py <fichier_pdf> --playwright --tag idf-oct-dec-2026 --mode complet
+
 Installation (Playwright - recommandé):
     pip install playwright
     playwright install chromium
@@ -1083,6 +1088,71 @@ def _ecrire_ligne_tournoi(ws, row, num, tournoi, epreuve):
 # 6. Sauvegarde / reprise JSON
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# 6b. Historique des extractions (pour mode mise à jour)
+# ---------------------------------------------------------------------------
+
+HISTORIQUE_DIR = "historique"
+
+
+def _chemin_historique(tag):
+    """Retourne le chemin du fichier historique pour un tag donné."""
+    # Nettoyer le tag pour en faire un nom de fichier valide
+    tag_safe = re.sub(r'[^\w\-]', '_', tag)
+    return os.path.join(HISTORIQUE_DIR, f"{tag_safe}.json")
+
+
+def charger_historique(tag):
+    """Charge l'historique des codes déjà extraits pour un tag.
+
+    Retourne un set de codes tournoi.
+    """
+    chemin = _chemin_historique(tag)
+    if not os.path.exists(chemin):
+        return set()
+    with open(chemin, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return set(data.get("codes", []))
+
+
+def sauvegarder_historique(tag, codes):
+    """Sauvegarde les codes tournoi extraits dans l'historique du tag.
+
+    Les nouveaux codes sont ajoutés aux codes existants (union).
+    """
+    os.makedirs(HISTORIQUE_DIR, exist_ok=True)
+    codes_existants = charger_historique(tag)
+    codes_tous = codes_existants | set(codes)
+    chemin = _chemin_historique(tag)
+    data = {
+        "tag": tag,
+        "codes": sorted(codes_tous),
+        "nb_codes": len(codes_tous),
+        "derniere_maj": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    with open(chemin, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    return chemin
+
+
+def lister_historiques():
+    """Liste tous les tags disponibles dans l'historique."""
+    if not os.path.exists(HISTORIQUE_DIR):
+        return []
+    tags = []
+    for f in sorted(os.listdir(HISTORIQUE_DIR)):
+        if f.endswith(".json"):
+            chemin = os.path.join(HISTORIQUE_DIR, f)
+            with open(chemin, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            tags.append({
+                "tag": data.get("tag", f[:-5]),
+                "nb_codes": data.get("nb_codes", 0),
+                "derniere_maj": data.get("derniere_maj", "?"),
+            })
+    return tags
+
+
 def sauvegarder_progres(tournois, codes_restants, chemin_json):
     """Sauvegarde le progrès pour pouvoir reprendre plus tard."""
     data = {
@@ -1294,12 +1364,47 @@ def main():
         "--test", metavar="CODE",
         help="Tester avec un seul code tournoi et afficher un diagnostic détaillé",
     )
+    parser.add_argument(
+        "--tag", metavar="NOM",
+        help=(
+            "Identifiant de la recherche (ex: idf-oct-dec-2026, loire-atlantique-jan-2027). "
+            "Permet de séparer les historiques par région/période pour le mode mise à jour."
+        ),
+    )
+    parser.add_argument(
+        "--mode", choices=["complet", "maj"],
+        default="complet",
+        help=(
+            "Mode d'extraction : 'complet' extrait tous les tournois (défaut), "
+            "'maj' n'extrait que les nouveaux tournois par rapport à l'historique du --tag."
+        ),
+    )
+    parser.add_argument(
+        "--list-tags", action="store_true",
+        help="Lister tous les tags d'historique disponibles et quitter.",
+    )
     args = parser.parse_args()
+
+    # Mode liste des tags
+    if args.list_tags:
+        tags = lister_historiques()
+        if not tags:
+            print("Aucun historique trouvé.")
+        else:
+            print(f"{'Tag':<35} {'Tournois':>10}   Dernière MAJ")
+            print("-" * 70)
+            for t in tags:
+                print(f"{t['tag']:<35} {t['nb_codes']:>10}   {t['derniere_maj']}")
+        return
 
     # Mode test : tester un seul tournoi avec diagnostic détaillé
     if args.test:
         _mode_test(args)
         return
+
+    # Vérification : --mode maj nécessite --tag
+    if args.mode == "maj" and not args.tag:
+        parser.error("Le mode 'maj' nécessite --tag pour identifier l'historique à comparer.")
 
     # Vérifications des arguments
     if not args.pdf and not args.resume:
@@ -1357,6 +1462,24 @@ def main():
                 val = t.get(champ, "")
                 label = champ.replace("_", " ").capitalize()
                 print(f"    {label}: {val or '(vide)'}")
+
+    # Filtrage en mode mise à jour : ne garder que les nouveaux codes
+    if args.tag and args.mode == "maj" and not args.resume:
+        codes_connus = charger_historique(args.tag)
+        nb_avant = len(codes)
+        codes = [c for c in codes if c not in codes_connus]
+        # Filtrer aussi pdf_data pour ne garder que les nouveaux
+        pdf_data = {c: v for c, v in pdf_data.items() if c not in codes_connus}
+        nb_nouveaux = len(codes)
+        print(f"\n  Mode mise à jour (tag: {args.tag}) :")
+        print(f"    Tournois dans le PDF      : {nb_avant}")
+        print(f"    Déjà dans l'historique     : {nb_avant - nb_nouveaux}")
+        print(f"    Nouveaux à extraire        : {nb_nouveaux}")
+        if nb_nouveaux == 0:
+            print("\n  Aucun nouveau tournoi à extraire.")
+            sys.exit(0)
+    elif args.tag and args.mode == "complet":
+        print(f"\n  Mode complet (tag: {args.tag}) : extraction de tous les tournois.")
 
     if not codes and not tournois:
         print("Aucun code de tournoi trouvé.")
@@ -1475,6 +1598,13 @@ def main():
     print(f"\nGénération du fichier Excel : {args.output}")
     nb_lignes = generer_excel(tournois, args.output)
     print(f"  -> {nb_lignes} ligne(s) écrite(s)")
+
+    # Sauvegarder l'historique si un tag est fourni
+    if args.tag:
+        codes_extraits = [t["code"] for t in tournois if t.get("code")]
+        chemin_hist = sauvegarder_historique(args.tag, codes_extraits)
+        codes_total = len(charger_historique(args.tag))
+        print(f"\n  Historique mis à jour : {chemin_hist} ({codes_total} tournoi(s) au total)")
 
     # Résumé
     nb_avec_epreuves = sum(1 for t in tournois if t.get("epreuves"))
