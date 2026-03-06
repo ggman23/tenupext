@@ -1154,6 +1154,100 @@ def _ecrire_ligne_tournoi(ws, row, num, tournoi, epreuve):
 
 
 # ---------------------------------------------------------------------------
+# 5b. Rapport de validation post-extraction
+# ---------------------------------------------------------------------------
+
+def _rapport_validation(tournois):
+    """Affiche un rapport de validation identifiant les tournois avec des champs manquants."""
+
+    # Champs critiques au niveau tournoi
+    champs_tournoi = [
+        ("nom", "Nom"),
+        ("club", "Club"),
+        ("debut", "Début"),
+        ("fin", "Fin"),
+        ("surface", "Surface"),
+        ("lieu", "Lieu"),
+    ]
+    # Champs critiques au niveau épreuve
+    champs_epreuve = [
+        ("classement", "Classement"),
+        ("format", "Format"),
+        ("tarif_jeune", "Tarif jeune"),
+    ]
+
+    # Filtrer uniquement les tournois qui ont des épreuves 11/12 ans
+    tournois_avec_epreuves = [t for t in tournois if t.get("epreuves")]
+
+    if not tournois_avec_epreuves:
+        return
+
+    problemes = []  # Liste de (code, nom, [champs_manquants])
+
+    for t in tournois_avec_epreuves:
+        code = t.get("code", "?")
+        nom = t.get("nom", "(sans nom)")
+        manquants = []
+
+        # Vérifier les champs tournoi
+        for champ, label in champs_tournoi:
+            val = t.get(champ, "")
+            if not val or not str(val).strip():
+                manquants.append(label)
+
+        # Vérifier les champs épreuve
+        for ep in t.get("epreuves", []):
+            for champ, label in champs_epreuve:
+                val = ep.get(champ, "")
+                if not val or not str(val).strip():
+                    ep_nom = ep.get("nom_epreuve", "épreuve")
+                    tag = f"{label} ({ep_nom})"
+                    if tag not in manquants:
+                        manquants.append(tag)
+
+        if manquants:
+            problemes.append((code, nom, manquants))
+
+    # Affichage du rapport
+    print(f"\n{'='*70}")
+    print(f"  RAPPORT DE VALIDATION")
+    print(f"{'='*70}")
+    print(f"  Tournois avec épreuve(s) 11/12 ans : {len(tournois_avec_epreuves)}")
+
+    if not problemes:
+        print(f"  ✓ Tous les champs importants sont renseignés !")
+    else:
+        print(f"  ⚠ {len(problemes)} tournoi(s) avec champ(s) manquant(s) :\n")
+        for code, nom, manquants in problemes:
+            print(f"  [{code}] {nom}")
+            for m in manquants:
+                print(f"           → {m} : VIDE")
+            print()
+
+    # Résumé par type de champ manquant
+    if problemes:
+        compteur = {}
+        for _, _, manquants in problemes:
+            for m in manquants:
+                # Extraire le nom du champ (avant la parenthèse si épreuve)
+                champ_base = m.split(" (")[0]
+                compteur[champ_base] = compteur.get(champ_base, 0) + 1
+
+        print(f"  --- Synthèse des champs manquants ---")
+        for champ, nb in sorted(compteur.items(), key=lambda x: -x[1]):
+            print(f"    {champ:15s} : {nb} tournoi(s)")
+
+    # Tournois en erreur
+    erreurs = [t for t in tournois if t.get("erreur")]
+    if erreurs:
+        print(f"\n  --- Tournois en erreur ({len(erreurs)}) ---")
+        for t in erreurs:
+            print(f"  [{t.get('code', '?')}] {t.get('erreur', '')}")
+
+    print(f"{'='*70}")
+
+
+# ---------------------------------------------------------------------------
 # 6. Sauvegarde / reprise JSON
 # ---------------------------------------------------------------------------
 
@@ -1714,6 +1808,9 @@ def main():
     print(f"  Erreurs : {nb_erreurs}")
     print(f"  Fichier Excel : {args.output}")
     print(f"  Script exécuté en {_formater_duree(duree_totale)}")
+
+    # Rapport de validation
+    _rapport_validation(tournois)
 
 
 if __name__ == "__main__":
