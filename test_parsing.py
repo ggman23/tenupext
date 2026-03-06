@@ -260,19 +260,23 @@ Simple Dames 13/14 ans
 
     # ──────────────────────────────────────────────────────────────
     print("\n=== TEST 12 : Classement parasite (bug 196945) ===")
-    # Simule une page où le texte contient "Classement demandé (...)" en plus
-    # du vrai classement NC - 30/2
+    # Reproduit la structure HTML réelle de tenup.fft.fr tournoi 196945 :
+    # - Description contenant "Classement demandé (...)" en texte libre
+    # - Vrai classement dans div.epreuve-detail-classement-detail
     HTML_CLASSEMENT_PARASITE = """
     <html><body>
     <div class="epreuve-card">
         <div class="badge">SM</div>
-        <div>Simple Messieurs 11/12 ans</div>
-        <div>Âge : 11/12 ans</div>
+        <div>Simple Messieurs (TS)</div>
+        <p>Classement demandé (classement, proximité et date d'inscription seront les critères pris en compte)</p>
+        <div class="epreuve-detail-age-classement">
+            <div>Âge : 11/12 ans</div>
+            <div class="epreuve-detail-classement-detail">
+                Classement : 30/5 - 30/1
+            </div>
+            <div class="epreuve-detail-format">Format : 2 - 2 sets à 6 jeux ; 3ème set = SJD à 10 points</div>
+        </div>
         <div>Tarif jeune : 35,00 €</div>
-        <div>Classement demandé (classement, proximité et date d'inscription seront les critères pris en compte)</div>
-        <div>Classement</div>
-        <div>30/5 - 30/1</div>
-        <div>Format : 2 sets à 6 jeux</div>
     </div>
     </body></html>
     """
@@ -285,9 +289,13 @@ Simple Dames 13/14 ans
         check("Classement valide (pas de texte parasite)",
               "proximité" not in classement,
               f"got: {classement!r}")
-        check("Classement correct 30/5 - 30/1",
-              "30/5" in classement or "30/1" in classement or classement == "",
+        check("Classement = 30/5 - 30/1",
+              "30/5" in classement and "30/1" in classement,
               f"got: {classement!r}")
+        fmt = ep.get("format", "")
+        check("Format via CSS selector",
+              "2 sets" in fmt.lower() or "SJD" in fmt,
+              f"got: {fmt!r}")
 
     # ──────────────────────────────────────────────────────────────
     print("\n=== TEST 13 : 'Retour aux résultats' filtré du nom d'épreuve ===")

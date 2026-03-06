@@ -796,20 +796,30 @@ def _extraire_details_epreuve(bloc):
         if match:
             epreuve["tarif_jeune"] = match.group(1).strip()
 
-    # Classement - essayer plusieurs patterns car label et valeur peuvent être
-    # sur des lignes séparées dans le DOM.
-    # On valide ensuite que ça ressemble à un vrai classement FFT.
+    # Classement - collecter TOUS les candidats puis prendre le premier valide.
+    # On utilise finditer car le texte peut contenir "Classement demandé (...)"
+    # avant le vrai "Classement : NC - 30/5".
     _classement_candidats = []
-    match = re.search(r"Classement\s*:?\s*(.+?)(?:\n|$)", texte, re.IGNORECASE)
-    if match and match.group(1).strip():
-        _classement_candidats.append(match.group(1).strip())
-    # Label "Classement" seul sur une ligne, valeur sur la ligne suivante
-    match = re.search(
+    # Stratégie 1 : CSS selector direct (classe tenup.fft.fr)
+    cls_el = bloc.select_one(".epreuve-detail-classement-detail")
+    if cls_el:
+        val = cls_el.get_text(strip=True)
+        cleaned = re.sub(r"^Classement\s*:?\s*", "", val, flags=re.IGNORECASE)
+        if cleaned:
+            _classement_candidats.append(cleaned)
+    # Stratégie 2 : regex sur TOUTES les occurrences de "Classement" dans le texte
+    for m in re.finditer(r"Classement\s*:?\s*(.+?)(?:\n|$)", texte, re.IGNORECASE):
+        val = m.group(1).strip()
+        if val:
+            _classement_candidats.append(val)
+    # Stratégie 3 : label "Classement" seul sur une ligne, valeur sur la suivante
+    for m in re.finditer(
         r"Classement\s*:?\s*\n+\s*(.+?)(?:\n|$)", texte, re.IGNORECASE
-    )
-    if match and match.group(1).strip():
-        _classement_candidats.append(match.group(1).strip())
-    # Chercher directement dans les éléments DOM enfants
+    ):
+        val = m.group(1).strip()
+        if val:
+            _classement_candidats.append(val)
+    # Stratégie 4 : élément DOM contenant exactement "Classement", valeur en sibling
     classement_el = bloc.find(
         string=re.compile(r"^\s*Classement\s*:?\s*$", re.IGNORECASE)
     )
@@ -834,12 +844,20 @@ def _extraire_details_epreuve(bloc):
             epreuve["classement"] = candidat
             break
 
-    # Format - essayer plusieurs patterns car label et valeur peuvent être
-    # sur des lignes séparées dans le DOM
-    match = re.search(r"Format\s*:\s*(.+?)(?:\n|$)", texte, re.IGNORECASE)
-    if match and match.group(1).strip():
-        epreuve["format"] = match.group(1).strip()
-    else:
+    # Format - CSS selector direct + regex
+    # Stratégie 1 : CSS selector (classe tenup.fft.fr)
+    fmt_el = bloc.select_one(".epreuve-detail-format")
+    if fmt_el:
+        val = fmt_el.get_text(strip=True)
+        cleaned = re.sub(r"^Format\s*:?\s*", "", val, flags=re.IGNORECASE)
+        if cleaned:
+            epreuve["format"] = cleaned
+    # Stratégie 2 : regex sur le texte
+    if "format" not in epreuve:
+        match = re.search(r"Format\s*:\s*(.+?)(?:\n|$)", texte, re.IGNORECASE)
+        if match and match.group(1).strip():
+            epreuve["format"] = match.group(1).strip()
+    if "format" not in epreuve:
         # Label "Format" seul sur une ligne, valeur sur la ligne suivante
         match = re.search(
             r"Format\s*:?\s*\n+\s*(.+?)(?:\n|$)", texte, re.IGNORECASE
@@ -847,18 +865,16 @@ def _extraire_details_epreuve(bloc):
         if match and match.group(1).strip():
             epreuve["format"] = match.group(1).strip()
     if "format" not in epreuve:
-        # Chercher directement dans les éléments DOM enfants
+        # Élément DOM contenant exactement "Format", valeur en sibling
         format_el = bloc.find(string=re.compile(r"^\s*Format\s*:?\s*$", re.IGNORECASE))
         if format_el:
             parent = format_el.find_parent()
             if parent:
-                # Valeur dans un élément frère
                 sibling = parent.find_next_sibling()
                 if sibling:
                     val = sibling.get_text(strip=True)
                     if val:
                         epreuve["format"] = val
-                # Valeur dans le même parent après le label
                 if "format" not in epreuve:
                     parent_text = parent.get_text(strip=True)
                     cleaned = re.sub(r"^Format\s*:?\s*", "", parent_text, flags=re.IGNORECASE)
@@ -935,19 +951,21 @@ def _extraire_epreuves_depuis_texte(texte):
                 if match:
                     epreuve["tarif_jeune"] = match.group(1).strip()
 
-                # Classement : valider que c'est un vrai classement FFT
+                # Classement : collecter TOUS les candidats (finditer)
                 _cls_candidats = []
-                match = re.search(
+                for m in re.finditer(
                     r"Classement\s*:?\s*(.+?)(?:\n|$)", bloc, re.IGNORECASE
-                )
-                if match and match.group(1).strip():
-                    _cls_candidats.append(match.group(1).strip())
-                match = re.search(
+                ):
+                    val = m.group(1).strip()
+                    if val:
+                        _cls_candidats.append(val)
+                for m in re.finditer(
                     r"Classement\s*:?\s*\n+\s*(.+?)(?:\n|$)", bloc,
                     re.IGNORECASE,
-                )
-                if match and match.group(1).strip():
-                    _cls_candidats.append(match.group(1).strip())
+                ):
+                    val = m.group(1).strip()
+                    if val:
+                        _cls_candidats.append(val)
                 for candidat in _cls_candidats:
                     if _est_classement_valide(candidat):
                         epreuve["classement"] = candidat
